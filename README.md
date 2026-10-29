@@ -47,17 +47,43 @@ A `$:` inside backticks is refused rather than skipped, because people often pas
 Manage stored keys:
 
 ```
-/safekeys list          # shows names, never values
+/safekeys list          # names and bindings, never values
 /safekeys rm STRIPE_KEY
 /safekeys clear         # removes all of them
 ```
 
 A key you add in one session works in all your open sessions right away.
 
+## Say where a key may go (optional)
+
+A key can carry a binding: the places it's allowed to go. Add `@` and a list after the name.
+
+| Type this | The key may go |
+|---|---|
+| `$:GH_TOKEN@api.github.com=ghp_...` | only to `api.github.com` |
+| `$:GEMINI@generativelanguage.googleapis.com=AIza...` | only to that host |
+| `$:WEB@*.example.com=...` | to `example.com`'s subdomains |
+| `$:VIRA_SUDO@ssh:vira.com=...` | only over `ssh`, `scp` or `rsync` to `vira.com` |
+| `$:VIRA_SUDO@ssh:vira-box=...` | to an SSH alias from `~/.ssh/config` (it also matches the host the alias points to) |
+| `$:SUDO_PW@local=...` | nowhere: it must not leave this machine (`sudo -S` locally is fine) |
+| `$:A@api.example.com,ssh:vira.com=...` | any of the listed places |
+| `$:K@any=...` | anywhere: same as no binding |
+| `$:GH_TOKEN@api.github.com` | (no `=`) changes the binding of a saved key, without retyping it |
+
+When Claude runs a command that uses a bound key, safekeys reads where the command would send it: web hosts in URLs or arguments, and the target of `ssh`, `scp`, `sftp` and `rsync`. If every destination is allowed, nothing changes. If the command would send the key somewhere else, or runs code safekeys can't read (`$(...)`, `eval`), safekeys stops and asks you before it runs. Saying no refuses the command. Saying yes lets it run once, and your normal permission checks, including auto mode's classifier, still apply on top.
+
+Several keys can share a host. Three Gemini keys from three accounts can all be bound to the same API host; pick the account by the key's name, like `$GEMINI_WORK`. Bind exact hosts rather than whole domains: a big domain such as `googleapis.com` also serves other people's content, so allowing all of it would allow a key to be sent to a stranger's bucket on the same domain.
+
+Keys without a binding aren't checked, so nothing changes unless you opt in.
+
+What a binding is for: it catches a key heading somewhere you didn't intend, by mistake or because Claude followed an instruction it read in a web page, an issue or an API response. What it can't do: stop a session that is already fully under an attacker's control, which can read the keychain directly without ever naming the key. The protection against that is Claude Code's own (its model, auto mode's classifier, the sandbox and your permission rules). A binding also can't judge what a request does at an allowed host.
+
+If you quote a binding example such as `$:NAME@host` and no key by that name exists, safekeys refuses it rather than storing the text as a key.
+
 ## How it works
 
 - **Your prompt:** the `$:` value is saved to the keychain under the service `claude_safekeys` and replaced with `$NAME`. If saving fails, the prompt isn't sent.
-- **Bash commands:** a command that uses `$NAME` gets the value from the keychain when it runs. The value never appears in the command text.
+- **Bash commands:** a command that uses `$NAME` gets a `. safekeys-env NAME` line in front. That small script ships with the plugin (in `bin/`, which Claude Code puts on the shell's `PATH`) and reads the value from the keychain as the command runs, so the value never appears in the command text. Keeping the keychain read inside the script also means auto mode's classifier no longer sees a raw keychain lookup in every command. It can still refuse a command that writes a key into a file or sends it out ("Credential Leakage"); that is its call to make, and you can run such a step yourself or add a permission rule for it.
 - **Tool output:** a stored value is replaced with `$NAME` before Claude reads it, in every field of the result (an Edit keeps the whole original file, for example). That covers the plain value and also hex, base64, URL- or JSON-escaped and reversed copies, plus any piece of 12 characters or more, even with colour codes mixed in.
 - **Tool input:** a tool call whose input contains a stored value, or any of those forms, is refused before it runs. So is a command that prints part or a changed copy of a key, like `${KEY:0:8}` or `${KEY^^}`. Claude can't write a key into a file, a command or a web request by itself.
 - **`@` mentions:** mentioning a file that holds a saved key (`@.env`) is refused with a notice. Ask Claude to read the file instead; that output is masked.
