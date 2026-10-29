@@ -2,15 +2,31 @@
 // one service, so `security`/`secret-tool` can list or wipe them as a group.
 // The mod holds them in memory only, to mask them in tool output. Every change
 // rewrites a stamp file, so other running sessions know to reload their copy.
+import { findLeak, maskDeep, maskText, shieldFor } from './shield.js'
+
 const SERVICE = 'claude_safekeys'
-// A bare value runs to the next whitespace; a value with spaces must be double-quoted.
-const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)=)?(?:"([^"]+)"|(\S+))/g
-const MIN_LENGTH = 6
+// A bare value runs to the next whitespace, minus trailing punctuation; a value
+// with spaces must be double-quoted, and the closing quote must end the token.
+const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:!?)\]}]))/g
+const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+// `$;` ending a prompt sends it without reading any $: token.
+const BYPASS = /\s*\$;\s*$/
+const CODE = /```[\s\S]*?```|`[^`\n]*`/g
+const REFERENCE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g
+const HINT = ' If it is only an example, add $; at the end to send the prompt as typed.'
+// Only what the person typed may store a key; a notification or peer message saying
+// `$:` is text, though stored values in it are still masked.
+const TYPED = new Set(['composer', 'bridge', 'sdk'])
+const MIN_LENGTH = 4
+// Longer values would overflow the stack while their encoded forms are built.
+const MAX_LENGTH = 4096
 const RESERVED = new Set(['PATH', 'HOME', 'SHELL', 'USER', 'PWD', 'TMPDIR', 'LANG', 'IFS', 'PS1'])
 
 let platform
 let stampFile
 let vault
+// The last list that loaded, so a keychain that later fails to answer still masks.
+let lastGood = new Map()
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
@@ -24,15 +40,49 @@ export function register(on) {
 
   // A hook that fails before next() is skipped and the prompt would go out raw,
   // so any failure drops the prompt instead.
-  on('prompt.submit', storeSecrets).catch(async ($, e, next) => {
+  on('prompt.submit', guardPrompt).catch(async ($, e, next) => {
     if (next.called) return next(e)
     return { drop: 'safekeys could not store the $: value (it needs the macOS Keychain, or secret-tool on Linux), so the prompt was not sent.' }
   })
 
   // Once the tool has run, a failed check withholds its result rather than risk a raw value.
-  on('tool.call', maskSecrets).catch(async ($, e, next) => {
+  on('tool.call', guardTool).catch(async ($, e, next) => {
     if (!next.called) return next(e)
     return { deny: 'safekeys could not check this result for secrets, so it was withheld.' }
+  })
+
+  // An @-mentioned file is attached without a tool call, so a file holding a key is refused.
+  on('prompt.mention', async ($, e, next) => {
+    const secrets = await currentSecrets($)
+    if (!secrets.size) return next(e)
+    let content
+    try {
+      content = await $.fs.read(e.path)
+    } catch {
+      return next(e)
+    }
+    const leaked = typeof content === 'string' && findLeak(content, shieldFor(secrets), 'output')
+    if (!leaked) return next(e)
+    await $.ui.toast(`@${e.mention} holds $${leaked}, so it was not attached. Ask Claude to read the file instead; that output is masked.`)
+    return { deny: `safekeys: the file holds the value of $${leaked}` }
+  })
+
+  // Reminders such as "this file changed" carry file text. Organisation-managed sessions
+  // don't run a user's mod on this event; there this hook does nothing.
+  on('prompt.attachment', async ($, e, next) => {
+    const secrets = await currentSecrets($)
+    if (!secrets.size) return next(e)
+    const text = maskText(e.text, shieldFor(secrets))
+    return next(text === e.text ? e : { ...e, text })
+  })
+
+  // A forked slash command never raises prompt.submit, so its arguments are checked here.
+  on('command.run', async ($, e, next) => {
+    if (e.args.match(TOKEN)) return { text: 'safekeys: a $: value cannot be passed to a slash command. Send it in a normal prompt.' }
+    const secrets = await currentSecrets($)
+    if (!secrets.size) return next(e)
+    const args = maskText(e.args, shieldFor(secrets), 'input')
+    return next(args === e.args ? e : { ...e, args })
   })
 
   on('command.run', { command: 'safekeys' }, async ($, e) => {
@@ -43,57 +93,116 @@ export function register(on) {
     }
     if (action === 'rm' && secrets.has(name)) {
       await forget($, name)
-      secrets.delete(name)
       return { text: 'Removed $' + name }
     }
     if (action === 'clear') {
       for (const n of secrets.keys()) await forget($, n)
-      secrets.clear()
       return { text: 'Removed every safekeys secret.' }
     }
     return { text: 'Usage: /safekeys list | rm NAME | clear' }
   })
 }
 
-async function storeSecrets($, e, next) {
-  const found = [...e.text.matchAll(TOKEN)]
-  if (!found.length) return next(e)
-  if (e.command) return { drop: 'safekeys cannot rewrite a slash command. Send $:NAME=value in a normal prompt.' }
-  const secrets = await loadVault($)
-  const stored = []
-  let text = e.text
-  for (const [token, given, quoted, bare] of found) {
-    const value = quoted ?? bare
-    const name = given ?? freshName(secrets)
-    const problem = refusal(name, value)
-    if (problem) return { drop: problem }
-    await save($, name, value)
-    secrets.set(name, value)
-    stored.push('$' + name)
-    text = text.replace(token, '$' + name)
+async function guardPrompt($, e, next) {
+  const bypass = BYPASS.test(e.text)
+  const typed = e.text.replace(BYPASS, '')
+  const secrets = await currentSecrets($)
+  const tokens = bypass || !TYPED.has(e.origin?.kind) ? [] : [...typed.matchAll(TOKEN)]
+  if (tokens.length && e.command) return { drop: 'safekeys cannot rewrite a slash command. Send $:NAME=value in a normal prompt.' }
+
+  const code = [...typed.matchAll(CODE)].map(m => [m.index, m.index + m[0].length])
+  if (tokens.some(m => code.some(([start, end]) => m.index >= start && m.index < end))) {
+    return { drop: 'A $: value is inside backticks, so safekeys did not store it and did not send the prompt. If it is a real key, take it out of the backticks.' + HINT }
   }
-  return next({ ...e, text, context: [...(e.context ?? []), briefing(stored)] })
+
+  // Plan every token before saving any, so a refused prompt leaves nothing stored.
+  const taken = new Set(secrets.keys())
+  const named = new Set()
+  const planned = []
+  for (const match of tokens) {
+    const [token, given, quoted, bare] = match
+    // $:NAME naming a saved key is a reference to it, not a new value.
+    const reference = !given && secrets.has(bare)
+    const name = reference ? bare : given ?? freshName(taken)
+    const value = reference ? undefined : quoted ?? bare
+    const problem = value !== undefined && (named.has(name) ? `$${name} is set twice in this prompt.` : refusal(name, value))
+    if (problem) return { drop: problem + HINT }
+    taken.add(name)
+    named.add(name)
+    planned.push({ at: match.index, token, name, value })
+  }
+
+  const updated = new Map(secrets)
+  let text = ''
+  let last = 0
+  for (const { at, token, name, value } of planned) {
+    if (value !== undefined) {
+      await save($, name, value)
+      updated.set(name, value)
+    }
+    text += typed.slice(last, at) + '$' + name
+    last = at + token.length
+  }
+  text = maskText(text + typed.slice(last), shieldFor(updated), 'input')
+
+  const names = storedReferences(text, updated)
+  // A slash command's line can't be rewritten, only let through or stopped.
+  if (e.command) {
+    if (text === typed) return next(e)
+    return { drop: 'This slash command holds a saved key. Use its $NAME instead.' }
+  }
+  if (text === e.text && !names.length) return next(e)
+  return next({ ...e, text, context: names.length ? [...(e.context ?? []), briefing(names)] : e.context })
 }
 
-async function maskSecrets($, e, next) {
-  const secrets = await loadVault($)
+function storedReferences(text, secrets) {
+  return [...new Set([...text.matchAll(REFERENCE)].map(m => m[1]).filter(name => secrets.has(name)))].map(name => '$' + name)
+}
+
+async function guardTool($, e, next) {
+  const secrets = await currentSecrets($)
   if (!secrets.size) return next(e)
-  const call = e.tool === 'Bash' ? withSecrets(e, secrets, await os($)) : e
-  const r = await next(call)
-  if (!leaks(r.text, secrets)) return r
-  if (r.isError) return { deny: mask(r.text, secrets) }
-  return { result: maskDeep(r.result, secrets), context: r.context }
+  const shield = shieldFor(secrets)
+  const leaked = findLeak(e, shield)
+  if (leaked) {
+    return { deny: `safekeys blocked this call: its input holds the value of $${leaked}, or an encoded piece of it. Refer to it as $${leaked} instead.` }
+  }
+  const sliced = e.tool === 'Bash' && [...secrets.keys()].find(name => slicePattern(name).test(e.command))
+  if (sliced) {
+    return { deny: `safekeys blocked this command: it would print part or a transformed copy of $${sliced}. Use $${sliced} whole.` }
+  }
+  const r = await next(e.tool === 'Bash' ? withSecrets(e, secrets, await os($)) : e)
+  if (r.deny) return r
+  // Every field is masked, not only the text Claude reads: an Edit's result keeps the
+  // whole original file, and the transcript stores all of it.
+  const result = maskDeep(r.result, shield)
+  const context = maskDeep(r.context, shield)
+  const text = typeof r.text === 'string' ? maskText(r.text, shield) : r.text
+  if (result === r.result && context === r.context && text === r.text) return r
+  if (r.isError) return { deny: text }
+  if (result !== r.result || context !== r.context) return { result, context }
+  // Only the model's rendering held a value: withhold it rather than guess at the record.
+  return { deny: text }
+}
+
+// ${NAME:3}, ${NAME#x}, ${NAME^^} and the like print a piece or a changed copy of
+// the value; ${NAME:-default} and its kin print it whole and are left alone.
+function slicePattern(name) {
+  return new RegExp('\\$\\{' + name + '(?::(?![-=?+])|[#%/^,@])')
 }
 
 function refusal(name, value) {
   if (RESERVED.has(name.toUpperCase())) return `$${name} is a reserved environment variable. Pick another name.`
   if (value.length < MIN_LENGTH) return `The value for $${name} is shorter than ${MIN_LENGTH} characters, too short to mask safely.`
+  if (value.length > MAX_LENGTH) return `The value for $${name} is longer than ${MAX_LENGTH} characters, too long to store.`
+  // macOS hands such values back hex-encoded, so they can't be used or checked.
+  if (/[^\x20-\x7e]/.test(value)) return `The value for $${name} has a line break or a non-ASCII character, which safekeys can't store intact.`
 }
 
-function freshName(secrets) {
+function freshName(taken) {
   let name
   do name = 'SK_' + crypto.randomUUID().slice(0, 4).toUpperCase()
-  while (secrets.has(name))
+  while (taken.has(name))
   return name
 }
 
@@ -112,32 +221,21 @@ function withSecrets(e, secrets, system) {
   return { ...e, command: exports.join('\n') + '\n' + e.command }
 }
 
-function leaks(text, secrets) {
-  return typeof text === 'string' && [...secrets.values()].some(v => text.includes(v))
-}
-
-// Longest first, so a value that contains another is replaced whole.
-function byLength(secrets) {
-  return [...secrets].sort((a, b) => b[1].length - a[1].length)
-}
-
-function mask(text, secrets) {
-  for (const [name, value] of byLength(secrets)) text = text.split(value).join('$' + name)
-  return text
-}
-
-function maskDeep(result, secrets) {
-  let json = JSON.stringify(result)
-  for (const [name, value] of byLength(secrets)) json = json.split(JSON.stringify(value).slice(1, -1)).join('$' + name)
-  return JSON.parse(json)
-}
-
 // Keychain access: the only place that runs `security` or `secret-tool`.
 
 async function os($) {
   platform ??= (await $.process.run(['uname', '-s'])).stdout.trim()
   if (platform !== 'Darwin' && platform !== 'Linux') throw new Error('safekeys supports macOS and Linux only')
   return platform
+}
+
+async function currentSecrets($) {
+  try {
+    lastGood = await loadVault($)
+  } catch {
+    // keep masking with the last list that loaded
+  }
+  return lastGood
 }
 
 // Reloads whenever the stamp moved, including after this session's own change,
@@ -162,7 +260,9 @@ async function readStamp($) {
   }
 }
 
+// This session reloads on its next check whatever the stamp says; the stamp tells the others.
 async function markChanged($) {
+  vault = undefined
   await $.fs.write(await stampPath($), crypto.randomUUID())
 }
 
@@ -171,22 +271,34 @@ async function stampPath($) {
   return stampFile
 }
 
+// An item that won't read (deleted meanwhile, locked, not ours) is skipped, so one
+// bad item can't stop the rest from being masked.
 async function readAll($) {
   const secrets = new Map()
-  for (const name of await storedNames($)) secrets.set(name, await lookup($, name))
+  for (const name of await storedNames($)) {
+    try {
+      secrets.set(name, await lookup($, name))
+    } catch {
+      // skipped
+    }
+  }
   return secrets
 }
 
+// Names come back from the keychain, where any program can plant an item, so only
+// names that are plain shell variable names are trusted into commands and patterns.
 async function storedNames($) {
+  let names
   if (await os($) === 'Darwin') {
     const { stdout } = await $.process.run(['security', 'dump-keychain'])
-    return stdout.split(/^keychain: /m)
+    names = stdout.split(/^keychain: /m)
       .filter(item => item.includes(`"svce"<blob>="${SERVICE}"`))
       .map(item => item.match(/"acct"<blob>="([^"]*)"/)?.[1])
-      .filter(Boolean)
+  } else {
+    const { stdout, stderr } = await $.process.run(['secret-tool', 'search', '--all', '--unlock', 'service', SERVICE])
+    names = [...(stdout + stderr).matchAll(/^attribute\.account = (.+)$/gm)].map(m => m[1])
   }
-  const { stdout, stderr } = await $.process.run(['secret-tool', 'search', '--all', '--unlock', 'service', SERVICE])
-  return [...(stdout + stderr).matchAll(/^attribute\.account = (.+)$/gm)].map(m => m[1])
+  return [...new Set(names.filter(name => name && NAME.test(name)))]
 }
 
 function lookupCommand(system, name) {
