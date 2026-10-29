@@ -19,8 +19,8 @@ Claude uses `$STRIPE_KEY` like a normal environment variable, so the real key en
 In Claude Code (v2.1.287 or newer):
 
 ```
-/plugin marketplace add pravnyadv/claude-safekeys
-/plugin install safekeys
+/plugin marketplace add pravnyadv/claude-plugins
+/plugin install safekeys@pravnyadv
 ```
 
 Then run `/reload-plugins` or start a new session.
