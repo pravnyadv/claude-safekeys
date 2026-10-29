@@ -1,0 +1,16 @@
+{
+  "name": "safekeys",
+  "owner": {
+    "name": "Praveen Yadav"
+  },
+  "metadata": {
+    "description": "safekeys: hand API keys to Claude Code without them entering the conversation"
+  },
+  "plugins": [
+    {
+      "name": "safekeys",
+      "source": "./safekeys",
+      "description": "Hand API keys to Claude Code without them entering the conversation, the transcript or your prompt history"
+    }
+  ]
+}
