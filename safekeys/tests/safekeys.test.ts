@@ -7,11 +7,15 @@ type System = 'Darwin' | 'Linux'
 // Answers $.process.run the way `uname`, `security` and `secret-tool` would,
 // backed by a Map instead of a real keychain.
 // `stamp` stands in for the shared stamp file; a test changes it to act as another session.
-function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[], stamp = { text: '' } } = {}) {
+// `unreadable` names items that are listed but won't read; `files` backs other fs.read paths.
+function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[], stamp = { text: '' }, unreadable = new Set<string>(), files = {} as Record<string, string> } = {}) {
   const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
   const missing = { value: { exitCode: 44, stdout: '', stderr: 'not found' } }
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }))
-  on('fs.read', () => (stamp.text ? { value: stamp.text } : { deny: 'ENOENT' }))
+  on('fs.read', ($, e) => {
+    if (!e.path.endsWith('safekeys.stamp')) return e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }
+    return stamp.text ? { value: stamp.text } : { deny: 'ENOENT' }
+  })
   on('fs.write', ($, e) => {
     stamp.text = e.text
     return { value: undefined }
@@ -31,7 +35,7 @@ function fakeKeychain(on, system: System, items = new Map<string, string>(), { b
       if (args[0] === 'dump-keychain') {
         return ok([...items.keys()].map(n => `keychain: "/k"\nattributes:\n    "acct"<blob>="${n}"\n    "svce"<blob>="claude_safekeys"\n`).join(''))
       }
-      if (args[0] === 'find-generic-password') return items.has(account) ? ok(items.get(account) + '\n') : missing
+      if (args[0] === 'find-generic-password') return items.has(account) && !unreadable.has(account) ? ok(items.get(account) + '\n') : missing
       if (args[0] === 'delete-generic-password') return items.delete(account) ? ok() : missing
     }
     if (cmd === 'secret-tool') {
@@ -49,7 +53,7 @@ function passThroughPrompts(on) {
   on('prompt.submit', ($, e) => ({ text: e.text, context: e.context }))
 }
 
-const prompt = (text: string) => ({ text, wait: false, origin: { kind: 'user' } })
+const prompt = (text: string, kind = 'composer') => ({ text, wait: false, origin: { kind } })
 
 test('a prompt without $: passes through untouched and never touches the keychain', async ($, on) => {
   on('process.run', () => { throw new Error('keychain touched') })
@@ -123,9 +127,122 @@ for (const system of ['Darwin', 'Linux'] as const) {
 test('a value too short to mask is refused and nothing is stored', async ($, on) => {
   const items = fakeKeychain(on, 'Darwin')
   passThroughPrompts(on)
-  const out = await $.prompt.submit(prompt('$:PIN=1234 hi'))
+  const out = await $.prompt.submit(prompt('$:PIN=123 hi'))
   expect(out.drop).toContain('too short')
   expect(items.size).toBe(0)
+})
+
+test('a 4-character value is masked anywhere in output, its hex and base64 too', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const printed = `pin=a1b2 x a1b2c3 hex=${hexOf('a1b2')} b64=${btoa('a1b2')}\n`
+  on('tool.call', () => ({ result: { stdout: printed }, text: printed }))
+  const sent = await $.prompt.submit(prompt('$:PIN=a1b2 use it'))
+  expect(sent.text).toBe('$PIN use it')
+  expect(items.get('PIN')).toBe('a1b2')
+  const out = await $.tool.call({ tool: 'Bash', command: 'make' })
+  expect(out.result.stdout).not.toContain('a1b2')
+  expect(out.result.stdout).not.toContain(hexOf('a1b2'))
+  expect(out.result.stdout).toContain('hex=$PIN')
+})
+
+test('a short value blocks a tool call only where it stands as a whole word', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['PIN', 'a1b2']]))
+  on('tool.call', () => ({ result: { stdout: 'ok' }, text: 'ok' }))
+  expect((await $.tool.call({ tool: 'Bash', command: 'echo a1b2c3' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'echo a1b2' })).deny).toContain('$PIN')
+})
+
+test('$:NAME for a saved key becomes a reference and stores nothing', async ($, on) => {
+  const argvs: string[] = []
+  const items = fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]), { argvs })
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('$:STRIPE_KEY put it in .env'))
+  expect(out.text).toBe('$STRIPE_KEY put it in .env')
+  expect(out.context[0]).toContain('$STRIPE_KEY')
+  expect(argvs.some(a => a.startsWith('security -i'))).toBe(false)
+  expect([...items]).toEqual([['STRIPE_KEY', FAKE]])
+})
+
+test('$:NAME for an unknown name is stored as a new value', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('$:OTHER_KEY go'))
+  expect(out.text).toMatch(/^\$SK_[0-9A-F]{4} go$/)
+  expect([...items.values()]).toContain('OTHER_KEY')
+})
+
+test('a name equal to its own value is still stored', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  await $.prompt.submit(prompt('$:ABCD=ABCD go'))
+  expect(items.get('ABCD')).toBe('ABCD')
+})
+
+test('$; at the end sends the prompt as typed, minus the marker, without touching the keychain', async ($, on) => {
+  on('process.run', () => { throw new Error('keychain touched') })
+  on('fs.read', () => { throw new Error('stamp touched') })
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('what does $:abc do and $:dummyvalue too? $;  '))
+  expect(out.text).toBe('what does $:abc do and $:dummyvalue too?')
+})
+
+test('$; anywhere but the end is not a bypass', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`a $; b $:STRIPE_KEY=${FAKE}`))
+  expect(out.text).toBe('a $; b $STRIPE_KEY')
+  expect(items.get('STRIPE_KEY')).toBe(FAKE)
+})
+
+for (const text of ['use this key: `$:STRIPE_KEY=' + FAKE + '`', 'like this:\n```\n$:NAME=' + FAKE + '\n```\n']) {
+  test(`a $: token in code is refused, not skipped: ${JSON.stringify(text.slice(0, 18))}`, async ($, on) => {
+    const items = fakeKeychain(on, 'Darwin')
+    passThroughPrompts(on)
+    const out = await $.prompt.submit(prompt(text))
+    expect(out.drop).toContain('backticks')
+    expect(out.drop).toContain('$;')
+    expect(items.size).toBe(0)
+  })
+}
+
+test('a prompt naming a saved key gets the note for Claude, and nothing else changes', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('put ${STRIPE_KEY} and $HOME in .env'))
+  expect(out.text).toBe('put ${STRIPE_KEY} and $HOME in .env')
+  expect(out.context[0]).toContain('$STRIPE_KEY')
+  expect(out.context[0]).not.toContain('$HOME')
+})
+
+test('a prompt with no saved key named gets no note', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('echo $HOME please'))
+  expect(out.context).toBeUndefined()
+})
+
+test('a broken keychain never blocks a prompt that only names variables', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map(), { broken: true })
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('echo $HOME please'))
+  expect(out.text).toBe('echo $HOME please')
+})
+
+test('when any token is refused, no token in that prompt is stored', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`$:STRIPE_KEY=${FAKE} and $:PIN=12`))
+  expect(out.drop).toContain('too short')
+  expect(out.drop).toContain('$;')
+  expect(items.size).toBe(0)
+})
+
+test('two unnamed values in one prompt get two different names', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  await $.prompt.submit(prompt(`$:${FAKE} $:${FAKE}x`))
+  expect(items.size).toBe(2)
 })
 
 test('a reserved name is refused', async ($, on) => {
@@ -148,6 +265,64 @@ test('a stored value is masked in any tool result, not just Bash', async ($, on)
   const out = await $.tool.call({ tool: 'Read', file_path: '.env' })
   expect(out.result.file.content).toBe('KEY=$STRIPE_KEY\n')
 })
+
+const hexOf = (s: string) => [...new TextEncoder().encode(s)].map(b => b.toString(16).padStart(2, '0')).join('')
+
+// Each row is output a command could print; all of it must reach Claude as $STRIPE_KEY.
+const disguises: [string, string][] = [
+  ['hex', hexOf(FAKE)],
+  ['upper-case hex', hexOf(FAKE).toUpperCase()],
+  ['reversed', [...FAKE].reverse().join('')],
+  ['a 14-character slice', FAKE.slice(3, 17)],
+  ['URL-encoded', encodeURIComponent(FAKE)],
+]
+for (const [label, printed] of disguises) {
+  test(`output that prints the value as ${label} is masked`, async ($, on) => {
+    fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+    on('tool.call', () => ({ result: { stdout: `x=${printed}\n` }, text: `x=${printed}\n` }))
+    const out = await $.tool.call({ tool: 'Bash', command: 'ls' })
+    expect(out.result.stdout).toBe('x=$STRIPE_KEY\n')
+  })
+}
+
+for (const prefix of ['', 'K', 'KE', 'KEY=']) {
+  test(`base64 output is masked whatever comes before the value (${prefix.length} bytes)`, async ($, on) => {
+    fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+    const encoded = btoa(prefix + FAKE + '\n')
+    on('tool.call', () => ({ result: { stdout: encoded }, text: encoded }))
+    const out = await $.tool.call({ tool: 'Bash', command: 'ls' })
+    expect(out.result.stdout).toContain('$STRIPE_KEY')
+    expect(out.result.stdout.length).toBeLessThan(encoded.length - 10)
+  })
+}
+
+test('ordinary output that shares a short prefix with a key is left alone', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  const text = 'build ok: wrote sk-test-config.json in 12.3s\n'
+  on('tool.call', () => ({ result: { stdout: text }, text }))
+  const out = await $.tool.call({ tool: 'Bash', command: 'make' })
+  expect(out.result.stdout).toBe(text)
+})
+
+const leakyCalls: [string, Record<string, unknown>][] = [
+  ['a file write holding the value', { tool: 'Write', file_path: 'a.txt', content: `key=${FAKE}` }],
+  ['a command holding its base64', { tool: 'Bash', command: `echo ${btoa(FAKE)} | base64 -d` }],
+  ['a web request holding a piece of it', { tool: 'WebFetch', url: `https://example.com/?k=${FAKE.slice(2, 16)}`, prompt: 'x' }],
+]
+for (const [label, call] of leakyCalls) {
+  test(`a tool call with ${label} is refused before it runs`, async ($, on) => {
+    fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+    let ran = false
+    on('tool.call', () => {
+      ran = true
+      return { result: 'ran', text: 'ran' }
+    })
+    const out = await $.tool.call(call)
+    expect(ran).toBe(false)
+    expect(out.deny).toContain('$STRIPE_KEY')
+    expect(out.deny).not.toContain(FAKE)
+  })
+}
 
 test('commands that never name a secret run unchanged', async ($, on) => {
   fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
@@ -194,4 +369,160 @@ test('/safekeys lists names only, and rm removes one', async ($, on) => {
   const removed = await $.command.run({ command: 'safekeys', args: 'rm A_KEY' })
   expect(removed.text).toBe('Removed $A_KEY')
   expect([...items.keys()]).toEqual(['B_KEY'])
+})
+
+// Regression tests for the security audit of 0.2.0, one per finding.
+
+test('every field of a result is masked, even when the text Claude reads is clean (Edit keeps the whole file)', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  on('tool.call', () => ({ result: { filePath: '.env', originalFile: `A=1\nSTRIPE_KEY=${FAKE}\n`, structuredPatch: [] }, text: 'Edited .env' }))
+  const out = await $.tool.call({ tool: 'Edit', file_path: '.env', old_string: 'A=1', new_string: 'A=2' })
+  expect(out.result.originalFile).toBe('A=1\nSTRIPE_KEY=$STRIPE_KEY\n')
+})
+
+test('one unreadable keychain item does not stop the others being masked', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['BROKEN', 'whatever-value'], ['STRIPE_KEY', FAKE]]), { unreadable: new Set(['BROKEN']) })
+  on('tool.call', () => ({ result: { stdout: FAKE }, text: FAKE }))
+  const out = await $.tool.call({ tool: 'Bash', command: 'cat .env' })
+  expect(out.result.stdout).toBe('$STRIPE_KEY')
+})
+
+test('a keychain item whose name is not a plain variable name is ignored', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([[';touch PWNED;x|', FAKE + 'evil'], ['STRIPE_KEY', FAKE]]))
+  let ran = ''
+  on('tool.call', ($, e) => {
+    ran = e.command
+    return { result: { stdout: 'ok' }, text: 'ok' }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'make' })
+  expect(ran).toBe('make')
+})
+
+test('an @-mention of a file holding a key is refused, and other files attach', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]), { files: { '/w/.env': `STRIPE_KEY=${FAKE}\n`, '/w/a.md': 'notes' } })
+  const toasts: string[] = []
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('prompt.mention', () => ({ type: 'file' }))
+  const env = await $.prompt.mention({ mention: '.env', path: '/w/.env' })
+  expect(env.deny).toContain('$STRIPE_KEY')
+  expect(toasts[0]).toContain('@.env')
+  expect((await $.prompt.mention({ mention: 'a.md', path: '/w/a.md' })).deny).toBeUndefined()
+})
+
+test('a reminder attachment that quotes a key is masked', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  on('prompt.attachment', ($, e) => ({ text: e.text }))
+  const out = await $.prompt.attachment({ type: 'edited_text_file', text: `.env changed:\nSTRIPE_KEY=${FAKE}`, origin: { kind: 'engine' } })
+  expect(out.text).toBe('.env changed:\nSTRIPE_KEY=$STRIPE_KEY')
+})
+
+test('a saved key pasted raw into a later prompt is masked there too', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`this log failed: Bearer ${FAKE} rejected`))
+  expect(out.text).toBe('this log failed: Bearer $STRIPE_KEY rejected')
+  expect(out.context[0]).toContain('$STRIPE_KEY')
+})
+
+test('a notification is masked but its $: text is never stored', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`ruby: $:.unshift lib, key ${FAKE}`, 'task-notification'))
+  expect(out.text).toBe('ruby: $:.unshift lib, key $STRIPE_KEY')
+  expect([...items.keys()]).toEqual(['STRIPE_KEY'])
+})
+
+test('a value with a non-ASCII character or a line break is refused', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  expect((await $.prompt.submit(prompt('$:K="café-1234" go'))).drop).toContain('non-ASCII')
+  expect((await $.prompt.submit(prompt('$:K=naïve-1234 go'))).drop).toContain('non-ASCII')
+  expect(items.size).toBe(0)
+})
+
+test('a storage failure never suggests $;, which would send the raw value', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map(), { broken: true })
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`$:STRIPE_KEY=${FAKE} go`))
+  expect(out.drop).toContain('was not sent')
+  expect(out.drop).not.toContain('$;')
+})
+
+test('output with colour codes inside the value is masked', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  const coloured = `\x1b[32m${FAKE.slice(0, 10)}\x1b[0m\x1b[1m${FAKE.slice(10)}\x1b[0m`
+  on('tool.call', () => ({ result: { stdout: coloured }, text: coloured }))
+  const out = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(out.result.stdout).toBe('$STRIPE_KEY')
+})
+
+test('a command that slices or transforms a key is refused; ${KEY:-default} is fine', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  on('tool.call', () => ({ result: { stdout: 'ok' }, text: 'ok' }))
+  for (const command of ['echo ${STRIPE_KEY:0:11}', 'echo ${STRIPE_KEY: -4}', 'echo ${STRIPE_KEY^^}', 'echo ${STRIPE_KEY#sk-}', 'echo ${STRIPE_KEY//a/b}']) {
+    expect((await $.tool.call({ tool: 'Bash', command })).deny).toContain('part or a transformed copy')
+  }
+  expect((await $.tool.call({ tool: 'Bash', command: 'echo "${STRIPE_KEY:-unset}" > .env' })).deny).toBeUndefined()
+})
+
+test('a closing quote must end the token, so no tail of the value leaks', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('$:DB_PW="hunter"2-Secret-xyz" go'))
+  expect(out.text).toBe('$DB_PW go')
+  expect(items.get('DB_PW')).toBe('"hunter"2-Secret-xyz"')
+})
+
+test('the same name twice in one prompt is refused', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`$:K=${FAKE} $:K=${FAKE}x`))
+  expect(out.drop).toContain('set twice')
+  expect(items.size).toBe(0)
+})
+
+test('trailing punctuation is not part of a bare value', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('use $:PIN=a1b2c3, then'))
+  expect(out.text).toBe('use $PIN, then')
+  expect(items.get('PIN')).toBe('a1b2c3')
+})
+
+test('a JSON-escaped copy of a value with quotes is masked', async ($, on) => {
+  const value = 'sk-test-"quoted"\\path9'
+  fakeKeychain(on, 'Darwin', new Map([['Q_KEY', value]]))
+  const printed = JSON.stringify({ key: value })
+  on('tool.call', () => ({ result: { stdout: printed }, text: printed }))
+  const out = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(out.result.stdout).toBe('{"key":"$Q_KEY"}')
+})
+
+test('a $: value passed to a slash command is refused, and saved keys in its arguments are masked', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  on('command.run', ($, e) => ({ text: 'ran ' + e.args }))
+  expect((await $.command.run({ command: 'deploy', args: `$:K=${FAKE}x` })).text).toContain('cannot be passed')
+  expect((await $.command.run({ command: 'deploy', args: `--token ${FAKE}` })).text).toBe('ran --token $STRIPE_KEY')
+})
+
+test('colours survive when the key is not split by them, and a split key is still masked whole', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
+  const whole = `\x1b[32mOK\x1b[0m ${FAKE} \x1b[33mDone\x1b[0m`
+  const split = `\x1b[32m${FAKE.slice(0, 10)}\x1b[0m${FAKE.slice(10)} and ${FAKE}`
+  let printed = whole
+  on('tool.call', () => ({ result: { stdout: printed }, text: printed }))
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).result.stdout).toBe('\x1b[32mOK\x1b[0m $STRIPE_KEY \x1b[33mDone\x1b[0m')
+  printed = split
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).result.stdout).toBe('$STRIPE_KEY and $STRIPE_KEY')
+})
+
+test('a value longer than 4096 characters is refused', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`$:BIG=${'a'.repeat(70000)} go`))
+  expect(out.drop).toContain('too long')
+  expect(items.size).toBe(0)
 })
