@@ -62,6 +62,8 @@ A mod's `prompt.submit` hook can rewrite a prompt before Claude Code stores or s
 2. **Bash:** when a command mentions a stored name, safekeys prefixes it with an `export NAME="$(security find-generic-password ...)"` line (`secret-tool lookup` on Linux). The value is fetched from the keychain at run time, so it never appears in the command text.
 3. **Every tool result:** any stored value in the output is replaced with its `$NAME` before Claude reads it. If that check itself fails, the result is withheld.
 
+Every save or removal rewrites a small stamp file, `~/.claude/safekeys.stamp` (under `CLAUDE_CONFIG_DIR` if you set one). It holds a random token, never a key. Each session checks the stamp before using its list of keys and reloads from the keychain when it has changed. A key you store in one session is therefore usable and masked in every other open session straight away, with no reload.
+
 ## Limits
 
 Read these before you rely on it:

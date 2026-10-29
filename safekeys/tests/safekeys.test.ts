@@ -6,9 +6,16 @@ type System = 'Darwin' | 'Linux'
 
 // Answers $.process.run the way `uname`, `security` and `secret-tool` would,
 // backed by a Map instead of a real keychain.
-function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[] } = {}) {
+// `stamp` stands in for the shared stamp file; a test changes it to act as another session.
+function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[], stamp = { text: '' } } = {}) {
   const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
   const missing = { value: { exitCode: 44, stdout: '', stderr: 'not found' } }
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }))
+  on('fs.read', () => (stamp.text ? { value: stamp.text } : { deny: 'ENOENT' }))
+  on('fs.write', ($, e) => {
+    stamp.text = e.text
+    return { value: undefined }
+  })
   on('process.run', ($, e) => {
     argvs.push(e.argv.join(' '))
     const [cmd, ...args] = e.argv
@@ -151,6 +158,33 @@ test('commands that never name a secret run unchanged', async ($, on) => {
   })
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   expect(ran).toBe('ls')
+})
+
+test('a key another session stores is picked up and masked without a reload', async ($, on) => {
+  const stamp = { text: 'first' }
+  const items = fakeKeychain(on, 'Darwin', new Map([['OLD_KEY', FAKE]]), { stamp })
+  on('tool.call', ($, e) => ({ result: { stdout: `NEW=${FAKE}new` }, text: `NEW=${FAKE}new` }))
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  items.set('NEW_KEY', FAKE + 'new')
+  stamp.text = 'second'
+  const out = await $.tool.call({ tool: 'Bash', command: 'cat .env' })
+  expect(out.result.stdout).toBe('NEW=$NEW_KEY')
+})
+
+test('the keychain is read once while nothing changes', async ($, on) => {
+  const argvs: string[] = []
+  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE]]), { argvs, stamp: { text: 'steady' } })
+  on('tool.call', () => ({ result: { stdout: 'ok' }, text: 'ok' }))
+  for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(argvs.filter(a => a === 'security dump-keychain').length).toBe(1)
+})
+
+test('storing a key moves the stamp so other sessions reload', async ($, on) => {
+  const stamp = { text: '' }
+  fakeKeychain(on, 'Linux', new Map(), { stamp })
+  passThroughPrompts(on)
+  await $.prompt.submit(prompt(`$:STRIPE_KEY=${FAKE} go`))
+  expect(stamp.text).toMatch(/^[0-9a-f-]{36}$/)
 })
 
 test('/safekeys lists names only, and rm removes one', async ($, on) => {

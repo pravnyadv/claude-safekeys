@@ -1,6 +1,7 @@
 // Values live in the OS keychain (macOS Keychain or a Linux Secret Service) under
 // one service, so `security`/`secret-tool` can list or wipe them as a group.
-// The mod holds them in memory only, to mask them in tool output.
+// The mod holds them in memory only, to mask them in tool output. Every change
+// rewrites a stamp file, so other running sessions know to reload their copy.
 const SERVICE = 'claude_safekeys'
 // A bare value runs to the next whitespace; a value with spaces must be double-quoted.
 const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)=)?(?:"([^"]+)"|(\S+))/g
@@ -8,6 +9,7 @@ const MIN_LENGTH = 6
 const RESERVED = new Set(['PATH', 'HOME', 'SHELL', 'USER', 'PWD', 'TMPDIR', 'LANG', 'IFS', 'PS1'])
 
 let platform
+let stampFile
 let vault
 
 export function register(on) {
@@ -138,12 +140,35 @@ async function os($) {
   return platform
 }
 
-function loadVault($) {
-  vault ??= readAll($).catch(error => {
-    vault = undefined
-    throw error
-  })
-  return vault
+// Reloads whenever the stamp moved, including after this session's own change,
+// so two sessions saving at once can't leave either with a stale list.
+async function loadVault($) {
+  const stamp = await readStamp($)
+  if (vault?.stamp !== stamp) {
+    const secrets = readAll($)
+    vault = { stamp, secrets }
+    secrets.catch(() => {
+      if (vault?.secrets === secrets) vault = undefined
+    })
+  }
+  return vault.secrets
+}
+
+async function readStamp($) {
+  try {
+    return await $.fs.read(await stampPath($))
+  } catch {
+    return ''
+  }
+}
+
+async function markChanged($) {
+  await $.fs.write(await stampPath($), crypto.randomUUID())
+}
+
+async function stampPath($) {
+  stampFile ??= ((await $.env.get('CLAUDE_CONFIG_DIR')) ?? (await $.env.get('HOME')) + '/.claude') + '/safekeys.stamp'
+  return stampFile
 }
 
 async function readAll($) {
@@ -182,12 +207,14 @@ async function save($, name, value) {
     ? await $.process.run(['security', '-i'], { stdin: `add-generic-password -U -s ${SERVICE} -a ${name} -X ${hex(value)}\n` })
     : await $.process.run(['secret-tool', 'store', '--label', 'safekeys ' + name, 'service', SERVICE, 'account', name], { stdin: value })
   if (exitCode !== 0 || await lookup($, name) !== value) throw new Error('safekeys could not store $' + name)
+  await markChanged($)
 }
 
 async function forget($, name) {
   await $.process.run(await os($) === 'Darwin'
     ? ['security', 'delete-generic-password', '-s', SERVICE, '-a', name]
     : ['secret-tool', 'clear', 'service', SERVICE, 'account', name])
+  await markChanged($)
 }
 
 function hex(value) {

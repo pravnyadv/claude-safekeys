@@ -1,6 +1,6 @@
 {
   "name": "safekeys",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Type $:NAME=value in a prompt: the value goes to your OS keychain, the conversation only ever sees $NAME, and tool output is masked",
   "author": {
     "name": "Praveen Yadav"
