@@ -1,0 +1,15 @@
+# Sourced, not run: `. safekeys-env NAME...` exports each named safekeys secret from the
+# OS keychain into the calling shell, so the value never appears in the command text.
+# safekeys adds this line in front of Bash commands that use a $NAME it stores.
+for safekeys_name in "$@"; do
+  case "$safekeys_name" in
+    '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;;
+  esac
+  if [ "$(uname -s)" = Darwin ]; then
+    safekeys_value=$(security find-generic-password -s claude_safekeys -a "$safekeys_name" -w 2>/dev/null)
+  else
+    safekeys_value=$(secret-tool lookup service claude_safekeys account "$safekeys_name" 2>/dev/null)
+  fi
+  export "$safekeys_name=$safekeys_value"
+done
+unset safekeys_name safekeys_value

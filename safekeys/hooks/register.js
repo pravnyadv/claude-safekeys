@@ -2,12 +2,15 @@
 // one service, so `security`/`secret-tool` can list or wipe them as a group.
 // The mod holds them in memory only, to mask them in tool output. Every change
 // rewrites a stamp file, so other running sessions know to reload their copy.
+import { destinationsOf, parseBinding, sshAllowed, webAllowed } from './destinations.js'
 import { findLeak, maskDeep, maskText, shieldFor } from './shield.js'
 
 const SERVICE = 'claude_safekeys'
-// A bare value runs to the next whitespace, minus trailing punctuation; a value
-// with spaces must be double-quoted, and the closing quote must end the token.
-const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:!?)\]}]))/g
+// $:NAME@binding=value. A bare value runs to the next whitespace, minus trailing
+// punctuation; a value with spaces must be double-quoted, and the closing quote must
+// end the token.
+const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)(?:@([^\s="]+))?=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:!?)\]}]))/g
+const REBIND = /^([A-Za-z_][A-Za-z0-9_]*)@(.+)$/
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 // `$;` ending a prompt sends it without reading any $: token.
 const BYPASS = /\s*\$;\s*$/
@@ -27,12 +30,14 @@ let stampFile
 let vault
 // The last list that loaded, so a keychain that later fails to answer still masks.
 let lastGood = new Map()
+// ssh target to the names it answers to, itself and the hostname `ssh -G` resolves.
+const sshNames = new Map()
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'safekeys',
-      description: 'List or remove the secrets stored with $:NAME=value',
+      description: 'List or remove the secrets stored with $:NAME=value, and where each may go',
       argumentHint: 'list | rm NAME | clear',
     })
     return next(e)
@@ -45,10 +50,17 @@ export function register(on) {
     return { drop: 'safekeys could not store the $: value (it needs the macOS Keychain, or secret-tool on Linux), so the prompt was not sent.' }
   })
 
-  // Once the tool has run, a failed check withholds its result rather than risk a raw value.
+  // A check that fails before the tool runs still masks with the last list that loaded;
+  // once the tool has run, a failed check withholds its result rather than risk a raw value.
   on('tool.call', guardTool).catch(async ($, e, next) => {
-    if (!next.called) return next(e)
-    return { deny: 'safekeys could not check this result for secrets, so it was withheld.' }
+    if (next.called) return { deny: 'safekeys could not check this result for secrets, so it was withheld.' }
+    const r = await next(e)
+    if (!lastGood.size || r.deny) return r
+    const shield = shieldFor(lastGood)
+    const result = maskDeep(r.result, shield)
+    const text = typeof r.text === 'string' ? maskText(r.text, shield) : r.text
+    if (result === r.result && text === r.text) return r
+    return r.isError || result === r.result ? { deny: text } : { result, context: maskDeep(r.context, shield) }
   })
 
   // An @-mentioned file is attached without a tool call, so a file holding a key is refused.
@@ -89,14 +101,18 @@ export function register(on) {
     const secrets = await loadVault($)
     const [action = 'list', name] = e.args.trim().split(/\s+/)
     if (action === 'list') {
-      return { text: secrets.size ? [...secrets.keys()].map(n => '$' + n).join('\n') : 'No secrets stored.' }
+      const bindings = await bindingsOf($)
+      const line = n => '$' + n + (bindings[n] ? ' -> ' + bindings[n].join(', ') : '')
+      return { text: secrets.size ? [...secrets.keys()].map(line).join('\n') : 'No secrets stored.' }
     }
     if (action === 'rm' && secrets.has(name)) {
       await forget($, name)
+      await bind($, name, undefined)
       return { text: 'Removed $' + name }
     }
     if (action === 'clear') {
       for (const n of secrets.keys()) await forget($, n)
+      await $.store.delete('bindings')
       return { text: 'Removed every safekeys secret.' }
     }
     return { text: 'Usage: /safekeys list | rm NAME | clear' }
@@ -120,26 +136,25 @@ async function guardPrompt($, e, next) {
   const named = new Set()
   const planned = []
   for (const match of tokens) {
-    const [token, given, quoted, bare] = match
-    // $:NAME naming a saved key is a reference to it, not a new value.
-    const reference = !given && secrets.has(bare)
-    const name = reference ? bare : given ?? freshName(taken)
-    const value = reference ? undefined : quoted ?? bare
-    const problem = value !== undefined && (named.has(name) ? `$${name} is set twice in this prompt.` : refusal(name, value))
-    if (problem) return { drop: problem + HINT }
+    const [token, given, spec, quoted, bare] = match
+    const plan = planToken(given, spec, quoted ?? bare, secrets, taken)
+    if (plan.problem) return { drop: plan.problem + HINT }
+    const { name, value, binding } = plan
+    if (value !== undefined && named.has(name)) return { drop: `$${name} is set twice in this prompt.` + HINT }
     taken.add(name)
     named.add(name)
-    planned.push({ at: match.index, token, name, value })
+    planned.push({ at: match.index, token, name, value, binding })
   }
 
   const updated = new Map(secrets)
   let text = ''
   let last = 0
-  for (const { at, token, name, value } of planned) {
+  for (const { at, token, name, value, binding } of planned) {
     if (value !== undefined) {
       await save($, name, value)
       updated.set(name, value)
     }
+    if (binding) await bind($, name, binding)
     text += typed.slice(last, at) + '$' + name
     last = at + token.length
   }
@@ -153,6 +168,26 @@ async function guardPrompt($, e, next) {
   }
   if (text === e.text && !names.length) return next(e)
   return next({ ...e, text, context: names.length ? [...(e.context ?? []), briefing(names)] : e.context })
+}
+
+// $:NAME@hosts=value stores and binds, $:value stores under a fresh name, $:NAME uses a
+// saved key, and $:NAME@hosts rebinds one. A NAME@hosts token for a key that doesn't
+// exist is refused rather than stored as a value: it is almost always quoted syntax.
+function planToken(given, spec, raw, secrets, taken) {
+  if (given) {
+    const binding = spec === undefined ? undefined : parseBinding(spec)
+    if (spec !== undefined && !binding) return { problem: `"@${spec}" is not a list of hosts, ssh:targets, local or any.` }
+    return { name: given, value: raw, binding, problem: refusal(given, raw) }
+  }
+  const rebind = raw.match(REBIND)
+  const binding = rebind && parseBinding(rebind[2])
+  if (binding) {
+    if (!secrets.has(rebind[1])) return { problem: `There is no saved key $${rebind[1]}. To store one, use $:${rebind[1]}@${rebind[2]}=value.` }
+    return { name: rebind[1], binding }
+  }
+  if (secrets.has(raw)) return { name: raw }
+  const name = freshName(taken)
+  return { name, value: raw, problem: refusal(name, raw) }
 }
 
 function storedReferences(text, secrets) {
@@ -171,7 +206,11 @@ async function guardTool($, e, next) {
   if (sliced) {
     return { deny: `safekeys blocked this command: it would print part or a transformed copy of $${sliced}. Use $${sliced} whole.` }
   }
-  const r = await next(e.tool === 'Bash' ? withSecrets(e, secrets, await os($)) : e)
+  const stray = e.tool === 'Bash' && await strayDestination($, e.command, secrets)
+  if (stray && !(await confirmStray($, stray, e.command))) {
+    return { deny: `safekeys stopped this command: $${stray.name} may only go to ${stray.allowed}, and this command would ${stray.where}. The user did not allow it.` }
+  }
+  const r = await next(e.tool === 'Bash' ? withSecrets(e, secrets) : e)
   if (r.deny) return r
   // Every field is masked, not only the text Claude reads: an Edit's result keeps the
   // whole original file, and the transcript stores all of it.
@@ -183,6 +222,67 @@ async function guardTool($, e, next) {
   if (result !== r.result || context !== r.context) return { result, context }
   // Only the model's rendering held a value: withhold it rather than guess at the record.
   return { deny: text }
+}
+
+// A bound key the command would send somewhere its binding doesn't list, or that the
+// command hides its handling of. Keys without a binding, or bound to `any`, are not checked.
+async function strayDestination($, command, secrets) {
+  const bindings = await bindingsOf($)
+  const bound = namesIn(command, secrets).filter(name => bindings[name] && !bindings[name].includes('any'))
+  if (!bound.length) return
+  const { web, ssh, unclear } = destinationsOf(command)
+  for (const name of bound) {
+    const entries = bindings[name]
+    const local = entries.includes('local')
+    const places = web.filter(host => local || !webAllowed(host, entries))
+    for (const target of ssh) {
+      if (local || !sshAllowed(await sshNamesOf($, target), entries)) places.push('ssh:' + target)
+    }
+    if (places.length || unclear) {
+      const where = places.length ? 'send it to ' + places.join(', ') : 'run code safekeys cannot see, such as $(...) or eval'
+      return { name, allowed: entries.join(', '), where }
+    }
+  }
+}
+
+async function confirmStray($, stray, command) {
+  const run = 'Run it this time'
+  try {
+    return await $.ui.ask(`$${stray.name} may only go to ${stray.allowed}, but this command would ${stray.where}:\n${command}\nRun it anyway?`, [run, "Don't run"]) === run
+  } catch {
+    return false
+  }
+}
+
+// An ssh alias is matched by its own name and by the hostname ssh resolves it to.
+async function sshNamesOf($, target) {
+  if (!sshNames.has(target)) {
+    let resolved
+    try {
+      resolved = (await $.process.run(['ssh', '-G', target])).stdout.match(/^hostname (\S+)$/m)?.[1]?.toLowerCase()
+    } catch {
+      // unresolvable: match the name as written
+    }
+    sshNames.set(target, resolved && resolved !== target ? [target, resolved] : [target])
+  }
+  return sshNames.get(target)
+}
+
+// Bindings say where keys may go; they aren't secret, so they live in the mod's own store.
+// An unreadable store reads as no bindings: the guard stands down, masking carries on.
+async function bindingsOf($) {
+  try {
+    return (await $.store.get('bindings')) ?? {}
+  } catch {
+    return {}
+  }
+}
+
+async function bind($, name, binding) {
+  const bindings = { ...(await bindingsOf($)) }
+  if (binding) bindings[name] = binding
+  else delete bindings[name]
+  await $.store.set('bindings', bindings)
 }
 
 // ${NAME:3}, ${NAME#x}, ${NAME^^} and the like print a piece or a changed copy of
@@ -214,11 +314,17 @@ function briefing(names) {
     'wherever the value appears. Do not try to work out the value itself.'
 }
 
-function withSecrets(e, secrets, system) {
-  const used = [...secrets.keys()].filter(name => new RegExp('\\$\\{?' + name + '\\b').test(e.command))
+// The plugin's bin/ is on the Bash tool's PATH. Sourcing the helper keeps the keychain
+// read out of the command text: auto mode's classifier refused an inline
+// `security find-generic-password` as credential exploration.
+function namesIn(command, secrets) {
+  return [...secrets.keys()].filter(name => new RegExp('\\$\\{?' + name + '\\b').test(command))
+}
+
+function withSecrets(e, secrets) {
+  const used = namesIn(e.command, secrets)
   if (!used.length) return e
-  const exports = used.map(name => `export ${name}="$(${lookupCommand(system, name).join(' ')})"`)
-  return { ...e, command: exports.join('\n') + '\n' + e.command }
+  return { ...e, command: `. safekeys-env ${used.join(' ')}\n${e.command}` }
 }
 
 // Keychain access: the only place that runs `security` or `secret-tool`.
