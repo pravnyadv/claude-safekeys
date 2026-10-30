@@ -16,6 +16,7 @@ const SSH_TOOLS = new Set(['ssh', 'scp', 'sftp', 'rsync'])
 const SSH_VALUED = new Set(['-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-P', '-Q', '-R', '-S', '-W', '-w'])
 const HOST = /^(\*\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}$|^(\d{1,3}\.){3}\d{1,3}$/i
 const SSH_TARGET = /^[A-Za-z0-9._-]+$/
+const REDIRECT = /^\d*[<>]/
 
 // The entries of a binding as typed after `@`, or undefined when it doesn't read as one.
 export function parseBinding(spec) {
@@ -29,23 +30,31 @@ export function parseBinding(spec) {
 // Where the command would send data: web hosts, and ssh targets. `unclear` when the
 // command hides part of what it runs.
 export function destinationsOf(command) {
-  const ssh = sshTargets(command)
+  const calls = sshCalls(command)
+  const ssh = [...new Set(calls.map(call => call.host))]
+  // A command run over ssh runs on a host the binding already trusts, so only explicit
+  // URLs in it count; its dotted words are mostly tables and files (mysql.user).
+  let here = command
+  for (const [start, end] of calls.map(call => call.remote).filter(Boolean).reverse()) {
+    here = here.slice(0, start) + ' ' + here.slice(end)
+  }
   const web = new Set()
   for (const m of command.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
-  for (const m of command.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
-  for (const m of command.matchAll(IPV4)) web.add(m[1])
+  for (const m of here.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
+  for (const m of here.matchAll(IPV4)) web.add(m[1])
   for (const target of ssh) web.delete(target)
   return { web: [...web], ssh, unclear: HIDDEN.test(command) }
 }
 
-function sshTargets(command) {
-  const targets = new Set()
-  for (const part of command.split(/;|&&|\|\||\||\n/)) {
-    const words = part.trim().split(/\s+/)
-    const tool = words[0]
+// Each ssh, scp, sftp or rsync call: its target, and for ssh the span of the command it
+// runs remotely, up to any local redirection.
+function sshCalls(command) {
+  const calls = []
+  for (const words of simpleCommands(command)) {
+    const tool = words[0].text
     if (!SSH_TOOLS.has(tool)) continue
     for (let i = 1; i < words.length; i++) {
-      const word = words[i].replace(/^['"]|['"]$/g, '')
+      const word = words[i].text
       if (word.startsWith('-')) {
         if (SSH_VALUED.has(word)) i++
         continue
@@ -53,13 +62,46 @@ function sshTargets(command) {
       // user@host:path for scp and rsync, user@host for ssh
       const host = word.replace(/^[^@]*@/, '').replace(/:.*$/, '').toLowerCase()
       if (tool === 'ssh' || tool === 'sftp') {
-        if (host) targets.add(host)
+        const remote = words.slice(i + 1)
+        const last = remote.findIndex(w => REDIRECT.test(w.text))
+        const ran = last < 0 ? remote : remote.slice(0, last)
+        if (host) calls.push({ host, remote: tool === 'ssh' && ran.length ? [ran[0].start, ran.at(-1).end] : undefined })
         break
       }
-      if (word.includes(':') && host) targets.add(host)
+      if (word.includes(':') && host) calls.push({ host })
     }
   }
-  return [...targets]
+  return calls
+}
+
+// The simple commands of a shell line, split at unquoted ; & | and newlines, as words
+// with quotes removed and their offsets in the line.
+function simpleCommands(line) {
+  const commands = [[]]
+  let word, quote
+  const close = () => {
+    if (word) commands.at(-1).push(word)
+    word = undefined
+  }
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (!quote && /[;&|\n]/.test(c)) {
+      close()
+      commands.push([])
+      continue
+    }
+    if (!quote && /\s/.test(c)) {
+      close()
+      continue
+    }
+    word ??= { text: '', start: i }
+    if (quote ? c === quote : c === "'" || c === '"') quote = quote ? undefined : c
+    else if (c === '\\' && quote !== "'" && i + 1 < line.length) word.text += line[++i]
+    else word.text += c
+    word.end = i + 1
+  }
+  close()
+  return commands.filter(words => words.length)
 }
 
 export function webAllowed(host, entries) {
