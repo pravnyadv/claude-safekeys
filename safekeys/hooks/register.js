@@ -123,7 +123,11 @@ async function guardPrompt($, e, next) {
   const bypass = BYPASS.test(e.text)
   const typed = e.text.replace(BYPASS, '')
   const secrets = await currentSecrets($)
-  const tokens = bypass || !TYPED.has(e.origin?.kind) ? [] : [...typed.matchAll(TOKEN)]
+  // CLAUDE_SMART_INTERNAL marks the `claude -p` calls claude-smart makes to read past conversations:
+  // a $: in that prompt is quoted history, never a key being handed over.
+  const capture = !bypass && TYPED.has(e.origin?.kind) && typed.includes('$:')
+    && (await $.env.get('CLAUDE_SMART_INTERNAL')) !== '1'
+  const tokens = capture ? [...typed.matchAll(TOKEN)] : []
   if (tokens.length && e.command) return { drop: 'safekeys cannot rewrite a slash command. Send $:NAME=value in a normal prompt.' }
 
   const code = [...typed.matchAll(CODE)].map(m => [m.index, m.index + m[0].length])

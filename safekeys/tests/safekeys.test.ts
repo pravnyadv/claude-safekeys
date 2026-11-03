@@ -196,6 +196,22 @@ test('$; at the end sends the prompt as typed, minus the marker, without touchin
   expect(out.text).toBe('what does $:abc do and $:dummyvalue too?')
 })
 
+test('a learning call quoting past conversations is sent as typed and stores nothing', async ($, on) => {
+  on('process.run', () => { throw new Error('keychain touched') })
+  on('env.get', ($, e) => ({ value: e.name === 'CLAUDE_SMART_INTERNAL' ? '1' : undefined }))
+  passThroughPrompts(on)
+  const quoted = `user: use \`$:VIRA_TOKEN\` here\nassistant: saved it with $:DEMO_KEY=${FAKE}`
+  const out = await $.prompt.submit(prompt(quoted, 'sdk'))
+  expect(out.text).toBe(quoted)
+})
+
+test('the same backticked $: from an sdk prompt is still refused without the marker', async ($, on) => {
+  fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt('use `$:VIRA_TOKEN` here', 'sdk'))
+  expect(out.text).toBeUndefined()
+})
+
 test('$; anywhere but the end is not a bypass', async ($, on) => {
   const items = fakeKeychain(on, 'Darwin')
   passThroughPrompts(on)
