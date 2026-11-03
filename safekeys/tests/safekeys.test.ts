@@ -9,10 +9,10 @@ type System = 'Darwin' | 'Linux'
 // `stamp` stands in for the shared stamp file; a test changes it to act as another session.
 // `unreadable` names items that are listed but won't read; `files` backs other fs.read paths.
 // `store` backs the mod's own key-value store (bindings); `ssh` maps an alias to the hostname `ssh -G` reports.
-function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[], stamp = { text: '' }, unreadable = new Set<string>(), files = {} as Record<string, string>, store = {} as Record<string, unknown>, ssh = {} as Record<string, string>, brokenStore = false } = {}) {
+function fakeKeychain(on, system: System, items = new Map<string, string>(), { broken = false, argvs = [] as string[], stamp = { text: '' }, unreadable = new Set<string>(), files = {} as Record<string, string>, store = {} as Record<string, unknown>, ssh = {} as Record<string, string>, brokenStore = false, env = {} as Record<string, string> } = {}) {
   const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
   const missing = { value: { exitCode: 44, stdout: '', stderr: 'not found' } }
-  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }))
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/test' : env[e.name] }))
   on('store.get', ($, e) => (brokenStore ? { deny: 'store unreadable' } : { value: store[e.key] }))
   on('store.set', ($, e) => {
     store[e.key] = e.value
@@ -210,6 +210,36 @@ test('the same backticked $: from an sdk prompt is still refused without the mar
   passThroughPrompts(on)
   const out = await $.prompt.submit(prompt('use `$:VIRA_TOKEN` here', 'sdk'))
   expect(out.text).toBeUndefined()
+})
+
+test('SAFEKEYS_IGNORE=1 lets any tool send quoted $: history through claude -p', async ($, on) => {
+  on('process.run', () => { throw new Error('keychain touched') })
+  on('env.get', ($, e) => ({ value: e.name === 'SAFEKEYS_IGNORE' ? '1' : undefined }))
+  passThroughPrompts(on)
+  const quoted = `earlier: \`$:VIRA_TOKEN\` and $:DEMO_KEY=${FAKE}`
+  expect((await $.prompt.submit(prompt(quoted, 'sdk'))).text).toBe(quoted)
+})
+
+test('a mark never unguards what a person types', async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin', new Map(), { env: { SAFEKEYS_IGNORE: '1', CLAUDE_SMART_INTERNAL: '1' } })
+  passThroughPrompts(on)
+  const out = await $.prompt.submit(prompt(`$:STRIPE_KEY=${FAKE} go`))
+  expect(out.text).toBe('$STRIPE_KEY go')
+  expect(items.get('STRIPE_KEY')).toBe(FAKE)
+})
+
+test('/safekeys ignore lists the marks and switching one off guards those prompts again', async ($, on) => {
+  const store: Record<string, any> = {}
+  fakeKeychain(on, 'Darwin', new Map(), { store, env: { CLAUDE_SMART_INTERNAL: '1' } })
+  passThroughPrompts(on)
+  const list = (await $.command.run({ command: 'safekeys', args: 'ignore' })).text
+  expect(list).toContain('CLAUDE_SMART_INTERNAL=1 on: claude-smart learning calls')
+  expect(list).toContain('SAFEKEYS_IGNORE=1 on')
+  await $.command.run({ command: 'safekeys', args: 'ignore off CLAUDE_SMART_INTERNAL' })
+  expect(store.marksOff).toEqual(['CLAUDE_SMART_INTERNAL'])
+  expect((await $.prompt.submit(prompt('use `$:VIRA_TOKEN` here', 'sdk'))).text).toBeUndefined()
+  await $.command.run({ command: 'safekeys', args: 'ignore on CLAUDE_SMART_INTERNAL' })
+  expect((await $.prompt.submit(prompt('use `$:VIRA_TOKEN` here', 'sdk'))).text).toBe('use `$:VIRA_TOKEN` here')
 })
 
 test('$; anywhere but the end is not a bypass', async ($, on) => {

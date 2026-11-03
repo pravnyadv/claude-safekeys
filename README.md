@@ -32,9 +32,27 @@ Then run `/reload-plugins`. macOS works as is. On Linux, install `secret-tool` (
 /safekeys list         # names, never values
 /safekeys rm STRIPE_KEY
 /safekeys clear
+/safekeys ignore       # tools whose quoted $: history is let through (below)
 ```
 
 To write about the `$:` syntax without storing anything, end the prompt with `$;`.
+
+## Tools that read past conversations
+
+Some tools send your old conversations back through `claude -p`, for example to learn from them. A `$:` quoted in that history is not a key being handed over, so safekeys must neither store it nor refuse the prompt. Such a tool marks its calls with an environment variable, and safekeys lets those prompts through as written (stored values in them are still masked):
+
+| Mark | Set by |
+|---|---|
+| `SAFEKEYS_IGNORE=1` | any tool, or a wrapper you put around one |
+| `CLAUDE_SMART_INTERNAL=1` | [claude-smart](https://github.com/ReflexioAI/claude-smart)'s learning calls (recognized as is) |
+
+For a tool that sets no mark, wrap the command it runs: `SAFEKEYS_IGNORE=1 exec claude "$@"`. A mark only counts for prompts sent through `claude -p` or the SDK; what you type in a session is always guarded, even with the variable exported.
+
+```
+/safekeys ignore                              # the marks and whether each is honored
+/safekeys ignore off CLAUDE_SMART_INTERNAL    # guard those prompts like any other again
+/safekeys ignore on CLAUDE_SMART_INTERNAL
+```
 
 ## Limit where a key can go (optional)
 

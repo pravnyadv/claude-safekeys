@@ -115,18 +115,50 @@ export function register(on) {
       await $.store.delete('bindings')
       return { text: 'Removed every safekeys secret.' }
     }
-    return { text: 'Usage: /safekeys list | rm NAME | clear' }
+    if (action === 'ignore') {
+      const [, state, mark] = e.args.trim().split(/\s+/)
+      const off = await marksOff($)
+      if ((state === 'on' || state === 'off') && mark in MARKS) {
+        await $.store.set('marksOff', state === 'off' ? [...new Set([...off, mark])] : off.filter(m => m !== mark))
+        return { text: `${mark} ${state === 'on' ? 'is honored' : 'is ignored; those prompts are guarded like any other'}` }
+      }
+      if (state) return { text: 'Usage: /safekeys ignore [on|off ' + Object.keys(MARKS).join('|') + ']' }
+      return { text: Object.entries(MARKS).map(([m, who]) => `${m}=1 ${off.includes(m) ? 'off' : 'on'}: ${who}`).join('\n') }
+    }
+    return { text: 'Usage: /safekeys list | rm NAME | clear | ignore' }
   })
+}
+
+// Marks that a tool sets on the `claude -p` calls it makes to read past conversations: a $: in such
+// a prompt is quoted history, never a key being handed over. Only prompts sent through claude -p or
+// the SDK honor a mark, so a stray export never unguards what a person types.
+const MARKS = {
+  SAFEKEYS_IGNORE: 'any tool, or a wrapper around one, that sets SAFEKEYS_IGNORE=1',
+  CLAUDE_SMART_INTERNAL: 'claude-smart learning calls',
+}
+
+// The mark this process carries and the user has not switched off, or ''.
+async function quotingMark($) {
+  const off = await marksOff($)
+  if (!off.includes('SAFEKEYS_IGNORE') && (await $.env.get('SAFEKEYS_IGNORE')) === '1') return 'SAFEKEYS_IGNORE'
+  if (!off.includes('CLAUDE_SMART_INTERNAL') && (await $.env.get('CLAUDE_SMART_INTERNAL')) === '1') return 'CLAUDE_SMART_INTERNAL'
+  return ''
+}
+
+async function marksOff($) {
+  try {
+    return (await $.store.get('marksOff')) ?? []
+  } catch {
+    return []
+  }
 }
 
 async function guardPrompt($, e, next) {
   const bypass = BYPASS.test(e.text)
   const typed = e.text.replace(BYPASS, '')
   const secrets = await currentSecrets($)
-  // CLAUDE_SMART_INTERNAL marks the `claude -p` calls claude-smart makes to read past conversations:
-  // a $: in that prompt is quoted history, never a key being handed over.
-  const capture = !bypass && TYPED.has(e.origin?.kind) && typed.includes('$:')
-    && (await $.env.get('CLAUDE_SMART_INTERNAL')) !== '1'
+  const kind = e.origin?.kind
+  const capture = !bypass && TYPED.has(kind) && typed.includes('$:') && !(kind === 'sdk' && await quotingMark($))
   const tokens = capture ? [...typed.matchAll(TOKEN)] : []
   if (tokens.length && e.command) return { drop: 'safekeys cannot rewrite a slash command. Send $:NAME=value in a normal prompt.' }
 
