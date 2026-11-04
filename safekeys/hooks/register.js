@@ -73,7 +73,7 @@ export function register(on) {
     } catch {
       return next(e)
     }
-    const leaked = typeof content === 'string' && findLeak(content, shieldFor(secrets), 'output')
+    const leaked = typeof content === 'string' && findLeak(content, shieldFor(secrets))
     if (!leaked) return next(e)
     await $.ui.toast(`@${e.mention} holds $${leaked}, so it was not attached. Ask Claude to read the file instead; that output is masked.`)
     return { deny: `safekeys: the file holds the value of $${leaked}` }
@@ -93,7 +93,7 @@ export function register(on) {
     if (e.args.match(TOKEN)) return { text: 'safekeys: a $: value cannot be passed to a slash command. Send it in a normal prompt.' }
     const secrets = await currentSecrets($)
     if (!secrets.size) return next(e)
-    const args = maskText(e.args, shieldFor(secrets), 'input')
+    const args = maskText(e.args, shieldFor(secrets))
     return next(args === e.args ? e : { ...e, args })
   })
 
@@ -194,7 +194,7 @@ async function guardPrompt($, e, next) {
     text += typed.slice(last, at) + '$' + name
     last = at + token.length
   }
-  text = maskText(text + typed.slice(last), shieldFor(updated), 'input')
+  text = maskText(text + typed.slice(last), shieldFor(updated))
 
   const names = storedReferences(text, updated)
   // A slash command's line can't be rewritten, only let through or stopped.

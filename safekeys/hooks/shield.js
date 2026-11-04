@@ -2,11 +2,11 @@
 // reversed, hex, URL- or JSON-escaped, base64 at any byte alignment, and any long
 // enough piece of those. Pure functions; register.js owns the keychain.
 //
-// Output (what Claude reads) is matched aggressively. Input (what Claude writes,
-// and prompts) matches a short value only as a whole word, so a 4-character key
-// can't block every command that happens to contain those letters.
+// A short value matches only as a whole word, in every form and both ways: a 4-digit
+// PIN matched anywhere would mask every number that contains it, and block every
+// command that does.
 
-// Below this length a value gets no fragment matching, and input matches it only as a word.
+// Below this length a value gets no fragment matching and matches only as a whole word.
 const SHORT = 8
 // Shorter fragments would match public key prefixes such as `sk_live_` or `github_pat_`.
 const FRAGMENT = 12
@@ -35,32 +35,31 @@ export function shieldFor(secrets) {
   return shield
 }
 
-// mode 'output' for tool results, 'input' for tool input and prompts.
-export function maskText(text, shield, mode = 'output') {
-  if (!text.includes('\x1b')) return maskPlain(text, shield, mode)
+export function maskText(text, shield) {
+  if (!text.includes('\x1b')) return maskPlain(text, shield)
   // Colour codes can split a value, so the text without them decides what must go. Masking
   // in place keeps the colours, and is used only when it removes exactly the same.
-  const maskedPlain = maskPlain(text.replace(ANSI, ''), shield, mode)
-  const inPlace = maskPlain(text, shield, mode)
+  const maskedPlain = maskPlain(text.replace(ANSI, ''), shield)
+  const inPlace = maskPlain(text, shield)
   return inPlace.replace(ANSI, '') === maskedPlain ? inPlace : maskedPlain
 }
 
 // Masks every string inside a value; returns the same object when nothing changed.
-export function maskDeep(value, shield, mode = 'output') {
-  if (typeof value === 'string') return maskText(value, shield, mode)
+export function maskDeep(value, shield) {
+  if (typeof value === 'string') return maskText(value, shield)
   if (!value || typeof value !== 'object') return value
   let changed = false
   const masked = Array.isArray(value) ? [] : {}
   for (const [key, item] of Object.entries(value)) {
-    masked[key] = maskDeep(item, shield, mode)
+    masked[key] = maskDeep(item, shield)
     changed ||= masked[key] !== item
   }
   return changed ? masked : value
 }
 
 // The name of a key whose value, or a piece of it, appears anywhere in `value`.
-export function findLeak(value, shield, mode = 'input') {
-  const masked = maskDeep(value, shield, mode)
+export function findLeak(value, shield) {
+  const masked = maskDeep(value, shield)
   if (masked === value) return
   const before = JSON.stringify(value)
   const after = JSON.stringify(masked)
@@ -71,12 +70,12 @@ export function findLeak(value, shield, mode = 'input') {
 function guardOf(name, value) {
   const short = value.length < SHORT
   const forms = formsOf(value)
-  return { name, ref: '$' + name, short, forms, word: wordPattern(value) }
+  return { name, ref: '$' + name, short, forms, words: short ? forms.map(wordPattern) : [] }
 }
 
-function maskPlain(text, { guards, windows }, mode) {
+function maskPlain(text, { guards, windows }) {
   for (const guard of guards) {
-    if (guard.short && mode === 'input') text = text.replace(guard.word, () => guard.ref)
+    if (guard.short) for (const word of guard.words) text = text.replace(word, () => guard.ref)
     else for (const form of guard.forms) text = text.split(form).join(guard.ref)
   }
   return maskFragments(text, windows)
@@ -98,6 +97,7 @@ function formsOf(value) {
     hexed.toUpperCase(),
     encodeURIComponent(value),
     JSON.stringify(value).slice(1, -1),
+    btoa(String.fromCharCode(...bytes)),
     ...base64,
     ...base64.map(core => core.replace(/\+/g, '-').replace(/\//g, '_')),
   ])].filter(form => form.length >= 4).sort((a, b) => b.length - a.length)

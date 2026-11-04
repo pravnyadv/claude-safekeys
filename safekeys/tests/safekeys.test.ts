@@ -141,7 +141,7 @@ test('a value too short to mask is refused and nothing is stored', async ($, on)
   expect(items.size).toBe(0)
 })
 
-test('a 4-character value is masked anywhere in output, its hex and base64 too', async ($, on) => {
+test('a 4-character value is masked in output as a whole word, its hex and base64 too', async ($, on) => {
   const items = fakeKeychain(on, 'Darwin')
   passThroughPrompts(on)
   const printed = `pin=a1b2 x a1b2c3 hex=${hexOf('a1b2')} b64=${btoa('a1b2')}\n`
@@ -150,9 +150,15 @@ test('a 4-character value is masked anywhere in output, its hex and base64 too',
   expect(sent.text).toBe('$PIN use it')
   expect(items.get('PIN')).toBe('a1b2')
   const out = await $.tool.call({ tool: 'Bash', command: 'make' })
-  expect(out.result.stdout).not.toContain('a1b2')
-  expect(out.result.stdout).not.toContain(hexOf('a1b2'))
-  expect(out.result.stdout).toContain('hex=$PIN')
+  expect(out.result.stdout).toBe('pin=$PIN x a1b2c3 hex=$PIN b64=$PIN\n')
+})
+
+test('a short value inside a longer number or id stays readable in output', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['PIN', '4242']]))
+  const printed = 'timeout=1424200 id=0x54242a7bc pin 4242\n'
+  on('tool.call', () => ({ result: { stdout: printed }, text: printed }))
+  const out = await $.tool.call({ tool: 'Bash', command: 'make' })
+  expect(out.result.stdout).toBe('timeout=1424200 id=0x54242a7bc pin $PIN\n')
 })
 
 test('a short value blocks a tool call only where it stands as a whole word', async ($, on) => {
