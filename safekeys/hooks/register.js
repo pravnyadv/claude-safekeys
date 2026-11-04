@@ -125,7 +125,15 @@ export function register(on) {
       if (state) return { text: 'Usage: /safekeys ignore [on|off ' + Object.keys(MARKS).join('|') + ']' }
       return { text: Object.entries(MARKS).map(([m, who]) => `${m}=1 ${off.includes(m) ? 'off' : 'on'}: ${who}`).join('\n') }
     }
-    return { text: 'Usage: /safekeys list | rm NAME | clear | ignore' }
+    if (action === 'bindings') {
+      const [, state] = e.args.trim().split(/\s+/)
+      if (state === 'on' || state === 'off') await $.store.set('bindingsOff', state === 'off')
+      else if (state) return { text: 'Usage: /safekeys bindings [on|off]' }
+      return { text: (await stored($, 'bindingsOff', false))
+        ? 'Bindings are off: bound keys go anywhere without asking. Masking is unchanged.'
+        : 'Bindings are on: a bound key headed anywhere else asks first.' }
+    }
+    return { text: 'Usage: /safekeys list | rm NAME | clear | ignore | bindings' }
   })
 }
 
@@ -146,11 +154,7 @@ async function quotingMark($) {
 }
 
 async function marksOff($) {
-  try {
-    return (await $.store.get('marksOff')) ?? []
-  } catch {
-    return []
-  }
+  return stored($, 'marksOff', [])
 }
 
 async function guardPrompt($, e, next) {
@@ -261,8 +265,10 @@ async function guardTool($, e, next) {
 }
 
 // A bound key the command would send somewhere its binding doesn't list, or that the
-// command hides its handling of. Keys without a binding, or bound to `any`, are not checked.
+// command hides its handling of. Keys without a binding, or bound to `any`, are not
+// checked, and none are while `/safekeys bindings off` holds.
 async function strayDestination($, command, secrets) {
+  if (await stored($, 'bindingsOff', false)) return
   const bindings = await bindingsOf($)
   const bound = namesIn(command, secrets).filter(name => bindings[name] && !bindings[name].includes('any'))
   if (!bound.length) return
@@ -307,10 +313,14 @@ async function sshNamesOf($, target) {
 // Bindings say where keys may go; they aren't secret, so they live in the mod's own store.
 // An unreadable store reads as no bindings: the guard stands down, masking carries on.
 async function bindingsOf($) {
+  return stored($, 'bindings', {})
+}
+
+async function stored($, key, fallback) {
   try {
-    return (await $.store.get('bindings')) ?? {}
+    return (await $.store.get(key)) ?? fallback
   } catch {
-    return {}
+    return fallback
   }
 }
 

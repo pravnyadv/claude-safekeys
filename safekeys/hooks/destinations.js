@@ -2,7 +2,8 @@
 // Pure functions; register.js decides what to do with the answers.
 //
 // A binding is a list of entries: `local` (never leaves this machine), `any` (no limit),
-// `ssh:<host or alias>`, a web host (`api.example.com`), or `*.<domain>` for its subdomains.
+// `ssh:<host or alias>`, a web host (`api.example.com`), or `*.<domain>` for its subdomains,
+// over ssh too (`ssh:*.<domain>`).
 
 const URL_HOST = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^/\s'"@]*@)?([^/\s:'"?#\\]+)/gi
 const BARE_HOST = /(?<![\w.@/:-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?=$|[/\s'"?#;)])/gi
@@ -23,7 +24,7 @@ export function parseBinding(spec) {
   const entries = spec.split(',').map(entry => entry.trim().toLowerCase())
   const valid = entries.every(entry =>
     entry === 'local' || entry === 'any' || HOST.test(entry) ||
-    (entry.startsWith('ssh:') && SSH_TARGET.test(entry.slice(4))))
+    (entry.startsWith('ssh:') && (SSH_TARGET.test(entry.slice(4)) || HOST.test(entry.slice(4)))))
   return valid && entries.length ? [...new Set(entries)] : undefined
 }
 
@@ -110,5 +111,6 @@ export function webAllowed(host, entries) {
 
 // `names` holds the target as written and, when known, the hostname ssh resolves it to.
 export function sshAllowed(names, entries) {
-  return entries.some(entry => entry.startsWith('ssh:') && names.includes(entry.slice(4)))
+  const hosts = entries.filter(entry => entry.startsWith('ssh:')).map(entry => entry.slice(4))
+  return names.some(name => webAllowed(name, hosts))
 }

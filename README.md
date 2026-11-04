@@ -33,6 +33,7 @@ Then run `/reload-plugins`. macOS works as is. On Linux, install `secret-tool` (
 /safekeys rm STRIPE_KEY
 /safekeys clear
 /safekeys ignore       # tools whose quoted $: history is let through (below)
+/safekeys bindings     # whether key limits are checked (below)
 ```
 
 To write about the `$:` syntax without storing anything, end the prompt with `$;`.
@@ -63,11 +64,19 @@ $:GH_TOKEN@api.github.com=ghp_...        only that host
 $:VIRA_SUDO@ssh:vira.com=...             only over ssh/scp/rsync to vira.com
 $:SUDO_PW@local=...                      never leaves this machine
 $:KEY@api.example.com,ssh:box=...        any of these
+$:QA_PW@ssh:*.niswey.net=...             over ssh to any host under niswey.net
 ```
 
 Already saved a key without a limit? Add one without retyping the key: `$:GH_TOKEN@api.github.com` (no `=`). The same form changes an existing limit.
 
 If a command would send a bound key anywhere else, safekeys asks you before it runs. Keys without a limit aren't checked.
+
+To stop the questions for every key at once, keep the limits saved but switch them off:
+
+```
+/safekeys bindings off    # bound keys go anywhere without asking; masking is unchanged
+/safekeys bindings on
+```
 
 ## How it works
 
