@@ -40,6 +40,8 @@ To write about the `$:` syntax without storing anything, end the prompt with `$;
 
 A bare value ends at the first space, minus a trailing `, . ; : ? ) ] }` that prose puts after it (a trailing `!` stays). Quote a value that really ends in one of those: `$:PW="secret."`.
 
+`$:` is also Ruby's load path, so the shapes Ruby writes it in are left alone: `$:.unshift x`, `$:.include?(x)`, `$:<<` and `$:[0]`. Without this, pasting Ruby into a prompt would store a piece of code as a key. A bare value shaped like those, such as `$:.word` followed by a space, needs a name or quotes: `$:PW=.word` or `$:".word"`. Generated passwords almost never take that shape, and the named form is never affected.
+
 ## Tools that read past conversations
 
 Some tools send your old conversations back through `claude -p`, for example to learn from them. A `$:` quoted in that history is not a key being handed over, so safekeys must neither store it nor refuse the prompt. Such a tool marks its calls with an environment variable, and safekeys lets those prompts through as written (stored values in them are still masked):

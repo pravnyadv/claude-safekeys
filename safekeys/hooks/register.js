@@ -9,7 +9,9 @@ const SERVICE = 'claude_safekeys'
 // $:NAME@binding=value. A bare value runs to the next whitespace, minus trailing
 // , . ; : ? ) ] }, which prose puts after it; `!` stays, as passwords end in it far more
 // often. A value with spaces must be double-quoted, and the closing quote must end the token.
-const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)(?:@([^\s="]+))?=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:?)\]}]))/g
+// Ruby's load path `$:` is never a token in the shapes Ruby writes it: `$:.unshift x`,
+// `$:.include?(x)`, `$:<<` and `$:[0]`.
+const TOKEN = /\$:(?!\.[a-z_]\w*[?!]?(?=[\s(]|$)|<<|\[\d+\])(?:([A-Za-z_][A-Za-z0-9_]*)(?:@([^\s="]+))?=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:?)\]}]))/g
 const REBIND = /^([A-Za-z_][A-Za-z0-9_]*)@(.+)$/
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 // `$;` ending a prompt sends it without reading any $: token.

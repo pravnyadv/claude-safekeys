@@ -866,3 +866,15 @@ test('/safekeys says so when the keychain will not list, and bindings still swit
   expect(items.size).toBe(1)
   expect((await $.command.run({ command: 'safekeys', args: 'bindings off' })).text).toContain('off')
 })
+
+test("Ruby's $: load path is not a token, while values that only start like it still are", async ($, on) => {
+  const items = fakeKeychain(on, 'Darwin')
+  passThroughPrompts(on)
+  for (const text of ["why does $:.unshift File.expand_path('../lib', __FILE__) fail", 'is $:.include?(dir) true', "$:<<'lib' and $:[0]", "`$:.unshift(lib)` in a snippet"]) {
+    expect((await $.prompt.submit(prompt(text))).text).toBe(text)
+  }
+  expect(items.size).toBe(0)
+  const out = await $.prompt.submit(prompt('$:.k9#Xq!w2 and $:<x>Yz8 go'))
+  expect(out.text).toMatch(/^\$SK_[0-9A-F]{4} and \$SK_[0-9A-F]{4} go$/)
+  expect([...items.values()]).toEqual(['.k9#Xq!w2', '<x>Yz8'])
+})
