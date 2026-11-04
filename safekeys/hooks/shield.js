@@ -1,15 +1,18 @@
 // Finds stored values in text, in every form a command could print them: as is,
-// reversed, hex, URL- or JSON-escaped, base64 at any byte alignment, and any long
-// enough piece of those. Pure functions; register.js owns the keychain.
+// reversed, upper or lower case, hex (also spaced, as xxd and od print it), URL-, JSON-
+// or shell-escaped, base64 at any byte alignment, and any long enough piece of those.
+// Pure functions; register.js owns the keychain.
 //
-// A short value matches only as a whole word, in every form and both ways: a 4-digit
-// PIN matched anywhere would mask every number that contains it, and block every
-// command that does.
+// A short value matches only as a whole word, in every form and both ways: a PIN matched
+// anywhere would mask every number that contains it. Nor does it block a tool call that
+// holds it: `root` as a password is also the user name the same command passes.
 
 // Below this length a value gets no fragment matching and matches only as a whole word.
-const SHORT = 8
+const SHORT = 12
 // Shorter fragments would match public key prefixes such as `sk_live_` or `github_pat_`.
 const FRAGMENT = 12
+// Runs of hex pairs split by spaces or colons: xxd, od, hexdump.
+const SPACED_HEX = /\b[0-9a-f]{2,}(?:[ \t:]+[0-9a-f]{2,}){2,}\b/gi
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g
 const shields = new WeakMap()
 
@@ -29,7 +32,7 @@ export function shieldFor(secrets) {
         }
       }
     }
-    shield = { guards, windows }
+    shield = { guards, windows, long: { guards: guards.filter(guard => !guard.short), windows } }
     shields.set(secrets, shield)
   }
   return shield
@@ -57,14 +60,14 @@ export function maskDeep(value, shield) {
   return changed ? masked : value
 }
 
-// The name of a key whose value, or a piece of it, appears anywhere in `value`.
+// The name of a long key whose value, or a piece of it, appears anywhere in `value`.
 export function findLeak(value, shield) {
-  const masked = maskDeep(value, shield)
+  const masked = maskDeep(value, shield.long)
   if (masked === value) return
   const before = JSON.stringify(value)
   const after = JSON.stringify(masked)
   const count = (text, ref) => text.split(ref).length
-  return shield.guards.find(guard => count(after, guard.ref) > count(before, guard.ref))?.name
+  return shield.long.guards.find(guard => count(after, guard.ref) > count(before, guard.ref))?.name
 }
 
 function guardOf(name, value) {
@@ -73,7 +76,15 @@ function guardOf(name, value) {
   return { name, ref: '$' + name, short, forms, words: short ? forms.map(wordPattern) : [] }
 }
 
-function maskPlain(text, { guards, windows }) {
+function maskPlain(text, shield) {
+  return maskForms(text, shield).replace(SPACED_HEX, run => {
+    const joined = run.replace(/[ \t:]/g, '')
+    const masked = maskForms(joined, shield)
+    return masked === joined ? run : masked
+  })
+}
+
+function maskForms(text, { guards, windows }) {
   for (const guard of guards) {
     if (guard.short) for (const word of guard.words) text = text.replace(word, () => guard.ref)
     else for (const form of guard.forms) text = text.split(form).join(guard.ref)
@@ -92,11 +103,15 @@ function formsOf(value) {
   const base64 = [0, 1, 2].map(offset => base64Core(bytes, offset))
   return [...new Set([
     value,
+    value.toUpperCase(),
+    value.toLowerCase(),
     [...value].reverse().join(''),
     hexed,
     hexed.toUpperCase(),
     encodeURIComponent(value),
     JSON.stringify(value).slice(1, -1),
+    JSON.stringify(value).slice(1, -1).replace(/\//g, '\\/'),
+    value.replace(/[^\w/.:,+@%^=-]/g, '\\$&'),
     btoa(String.fromCharCode(...bytes)),
     ...base64,
     ...base64.map(core => core.replace(/\+/g, '-').replace(/\//g, '_')),

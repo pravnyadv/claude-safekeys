@@ -4,15 +4,26 @@
 // A binding is a list of entries: `local` (never leaves this machine), `any` (no limit),
 // `ssh:<host or alias>`, a web host (`api.example.com`), or `*.<domain>` for its subdomains,
 // over ssh too (`ssh:*.<domain>`).
+//
+// A question stops whatever the person is running, so only a destination the command
+// shows counts: a URL, an ssh/scp/rsync target, or a bare host handed to a network tool.
+// Loopback is this machine, and what runs on a remote host is that host's business.
 
 const URL_HOST = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^/\s'"@]*@)?([^/\s:'"?#\\]+)/gi
 const BARE_HOST = /(?<![\w.@/:-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?=$|[/\s'"?#;)])/gi
 const IPV4 = /(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])/g
 // Bare names that are far more often files than hosts.
 const FILE_ENDINGS = /\.(env|json|jsonl|txt|md|js|mjs|cjs|ts|tsx|jsx|py|rb|go|rs|php|java|kt|sh|zsh|bash|yml|yaml|toml|ini|cfg|conf|lock|log|csv|tsv|html|css|scss|sql|xml|pem|key|crt|pub|tar|gz|zip|png|jpg|svg|pdf|local|example|sample|bak|tmp|test|spec|config|d)$/i
-// Constructs that can run something the command text doesn't show.
-const HIDDEN = /\$\(|`|<\(|>\(|\beval\b|(^|[\s;&|])(source|\.)\s/
+const LOOPBACK = /^(localhost|.+\.localhost|127(\.\d{1,3}){3}|0\.0\.0\.0)$/
 const SSH_TOOLS = new Set(['ssh', 'scp', 'sftp', 'rsync'])
+// Tools that take a bare host as where to connect; elsewhere a dotted word is a file,
+// a table or a service name (mysql.user, nginx.service, com.apple.dock).
+// Matched as a word anywhere, so `bash -c "curl x"`, `xargs curl` and a ProxyCommand count too.
+const NETWORK_TOOL = /(?:^|[\s'"(;|&`/=])(?:curl|wget|nc|ncat|netcat|socat|telnet|ftp|lftp|http|https|xh|openssl|mysql|mariadb|psql|redis-cli|mongosh|mongo)(?=[\s'")]|$)/
+// Words that run the word after them: `sudo ssh`, `TERM=x ssh`, `sshpass -p pw ssh`.
+const WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'exec', 'nohup', 'time', 'nice', 'caffeinate', 'sshpass'])
+const WRAPPER_VALUED = new Set(['-u', '-g', '-p', '-f', '-n', '-C', '-h', '-D'])
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
 // ssh options that take a value, so the word after them is not the host.
 const SSH_VALUED = new Set(['-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-P', '-Q', '-R', '-S', '-W', '-w'])
 const HOST = /^(\*\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}$|^(\d{1,3}\.){3}\d{1,3}$/i
@@ -28,36 +39,56 @@ export function parseBinding(spec) {
   return valid && entries.length ? [...new Set(entries)] : undefined
 }
 
-// Where the command would send data: web hosts, and ssh targets. `unclear` when the
-// command hides part of what it runs.
+// Where the command would send data: web hosts, and ssh targets.
 export function destinationsOf(command) {
-  const calls = sshCalls(command)
+  const commands = simpleCommands(command)
+  const calls = commands.flatMap(sshCalls)
   const ssh = [...new Set(calls.map(call => call.host))]
-  // A command run over ssh runs on a host the binding already trusts, so only explicit
-  // URLs in it count; its dotted words are mostly tables and files (mysql.user).
+  // The command an ssh call runs is checked by the ssh target's binding alone.
   let here = command
   for (const [start, end] of calls.map(call => call.remote).filter(Boolean).reverse()) {
     here = here.slice(0, start) + ' ' + here.slice(end)
   }
   const web = new Set()
-  for (const m of command.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
-  for (const m of here.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
-  for (const m of here.matchAll(IPV4)) web.add(m[1])
+  for (const m of here.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
+  if (NETWORK_TOOL.test(here)) {
+    for (const m of here.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
+    for (const m of here.matchAll(IPV4)) web.add(m[1])
+  }
   for (const target of ssh) web.delete(target)
-  return { web: [...web], ssh, unclear: HIDDEN.test(command) }
+  return { web: [...web].filter(host => !LOOPBACK.test(host)), ssh }
 }
 
-// Each ssh, scp, sftp or rsync call: its target, and for ssh the span of the command it
-// runs remotely, up to any local redirection.
-function sshCalls(command) {
+// The command a simple command runs once wrappers and VAR=value words are skipped.
+function toolOf(words) {
+  let i = 0
+  while (i < words.length) {
+    const word = words[i].text
+    if (ASSIGNMENT.test(word)) i++
+    else if (WRAPPERS.has(basename(word))) {
+      i++
+      while (i < words.length && words[i].text.startsWith('-')) i += WRAPPER_VALUED.has(words[i].text) ? 2 : 1
+    } else break
+  }
+  return i < words.length ? { tool: basename(words[i].text), at: i } : undefined
+}
+
+function basename(word) {
+  return word.slice(word.lastIndexOf('/') + 1)
+}
+
+// The ssh, scp, sftp or rsync call in a simple command: its target, and for ssh the span
+// of the command it runs remotely, up to any local redirection.
+function sshCalls(words) {
   const calls = []
-  for (const words of simpleCommands(command)) {
-    const tool = words[0].text
-    if (!SSH_TOOLS.has(tool)) continue
-    for (let i = 1; i < words.length; i++) {
+  const { tool, at } = toolOf(words) ?? {}
+  if (SSH_TOOLS.has(tool)) {
+    for (let i = at + 1; i < words.length; i++) {
       const word = words[i].text
       if (word.startsWith('-')) {
-        if (SSH_VALUED.has(word)) i++
+        // A value letter takes the rest of its word (-p2222) or, last in a cluster, the next word (-vp 2222).
+        const letters = word.slice(1)
+        if (letters && [...letters].findIndex(letter => SSH_VALUED.has('-' + letter)) === letters.length - 1) i++
         continue
       }
       // user@host:path for scp and rsync, user@host for ssh

@@ -5,11 +5,12 @@ for safekeys_name in "$@"; do
   case "$safekeys_name" in
     '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;;
   esac
+  # A failed read leaves the variable as it was: an empty secret would fail later, and less clearly.
   if [ "$(uname -s)" = Darwin ]; then
     safekeys_value=$(security find-generic-password -s claude_safekeys -a "$safekeys_name" -w 2>/dev/null)
   else
     safekeys_value=$(secret-tool lookup service claude_safekeys account "$safekeys_name" 2>/dev/null)
-  fi
-  export "$safekeys_name=$safekeys_value"
+  fi && export "$safekeys_name=$safekeys_value" ||
+    echo "safekeys: could not read \$$safekeys_name from the keychain" >&2
 done
 unset safekeys_name safekeys_value

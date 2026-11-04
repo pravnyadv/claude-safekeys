@@ -38,6 +38,8 @@ Then run `/reload-plugins`. macOS works as is. On Linux, install `secret-tool` (
 
 To write about the `$:` syntax without storing anything, end the prompt with `$;`.
 
+A bare value ends at the first space, minus a trailing `, . ; : ? ) ] }` that prose puts after it (a trailing `!` stays). Quote a value that really ends in one of those: `$:PW="secret."`.
+
 ## Tools that read past conversations
 
 Some tools send your old conversations back through `claude -p`, for example to learn from them. A `$:` quoted in that history is not a key being handed over, so safekeys must neither store it nor refuse the prompt. Such a tool marks its calls with an environment variable, and safekeys lets those prompts through as written (stored values in them are still masked):
@@ -62,7 +64,7 @@ Add `@` and the allowed places after the name:
 ```
 $:GH_TOKEN@api.github.com=ghp_...        only that host
 $:VIRA_SUDO@ssh:vira.com=...             only over ssh/scp/rsync to vira.com
-$:SUDO_PW@local=...                      never leaves this machine
+$:SUDO_PW@local=...                      never leaves this machine (localhost is fine)
 $:KEY@api.example.com,ssh:box=...        any of these
 $:QA_PW@ssh:*.niswey.net=...             over ssh to any host under niswey.net
 ```
@@ -70,6 +72,8 @@ $:QA_PW@ssh:*.niswey.net=...             over ssh to any host under niswey.net
 Already saved a key without a limit? Add one without retyping the key: `$:GH_TOKEN@api.github.com` (no `=`). The same form changes an existing limit.
 
 If a command would send a bound key anywhere else, safekeys asks you before it runs. Keys without a limit aren't checked.
+
+A question stops whatever you're running, so safekeys only asks about a destination the command shows: a URL, an ssh/scp/rsync target (also behind `sudo`, `sshpass` or `VAR=value`), or a bare host given to a network tool such as `curl`, `nc` or `mysql`. Dotted names like `mysql.user` or `nginx.service`, `$(...)`, and `localhost` never ask. Whatever a command runs on an allowed ssh host is that host's business and isn't checked.
 
 To stop the questions for every key at once, keep the limits saved but switch them off:
 
@@ -82,13 +86,14 @@ To stop the questions for every key at once, keep the limits saved but switch th
 
 - Prompts are rewritten before Claude Code saves or sends them, so the key is replaced with `$NAME`.
 - Commands that use `$NAME` load the real value from the keychain as they run; the value never appears in the command.
-- Every tool result is masked before Claude reads it, including encoded copies (hex, base64 and so on) and long pieces of a key. A tool call that would write a key is refused.
+- Every tool result is masked before Claude reads it, including encoded copies (hex, also as `xxd` and `od` print it, base64, upper case, escaped and so on) and long pieces of a key. A tool call that would write a key of 12 or more characters is refused. A shorter key is masked only as a whole word and never refuses a call: `root` as a password is also the user name in the same command.
 
 ## Limits
 
 - It prevents accidental leaks. It can't stop a session that an attacker already controls.
 - Auto mode may still refuse a command that writes a key to a file. That's auto mode's decision; run that step yourself if needed.
 - The key is visible in your input box until you press Enter.
+- A destination held in a variable (`curl "$API_URL"`) or run by a script can't be seen, so it isn't checked.
 
 ## Develop
 

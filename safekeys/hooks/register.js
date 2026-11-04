@@ -7,9 +7,9 @@ import { findLeak, maskDeep, maskText, shieldFor } from './shield.js'
 
 const SERVICE = 'claude_safekeys'
 // $:NAME@binding=value. A bare value runs to the next whitespace, minus trailing
-// punctuation; a value with spaces must be double-quoted, and the closing quote must
-// end the token.
-const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)(?:@([^\s="]+))?=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:!?)\]}]))/g
+// , . ; : ? ) ] }, which prose puts after it; `!` stays, as passwords end in it far more
+// often. A value with spaces must be double-quoted, and the closing quote must end the token.
+const TOKEN = /\$:(?:([A-Za-z_][A-Za-z0-9_]*)(?:@([^\s="]+))?=)?(?:"([^"\n]+)"(?=\s|$)|(\S*[^\s,.;:?)\]}]))/g
 const REBIND = /^([A-Za-z_][A-Za-z0-9_]*)@(.+)$/
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 // `$;` ending a prompt sends it without reading any $: token.
@@ -19,7 +19,7 @@ const REFERENCE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g
 const HINT = ' If it is only an example, add $; at the end to send the prompt as typed.'
 // Only what the person typed may store a key; a notification or peer message saying
 // `$:` is text, though stored values in it are still masked.
-const TYPED = new Set(['composer', 'bridge', 'sdk'])
+const TYPED = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
 const MIN_LENGTH = 4
 // Longer values would overflow the stack while their encoded forms are built.
 const MAX_LENGTH = 4096
@@ -97,44 +97,50 @@ export function register(on) {
     return next(args === e.args ? e : { ...e, args })
   })
 
-  on('command.run', { command: 'safekeys' }, async ($, e) => {
+  on('command.run', { command: 'safekeys' }, ($, e) => safekeysCommand($, e).catch(() => ({
+    text: 'safekeys could not read the keychain (is it locked?).',
+  })))
+}
+
+// /safekeys: list, rm, clear, ignore and bindings.
+async function safekeysCommand($, e) {
+  const [action = 'list', name] = e.args.trim().split(/\s+/)
+  if (action === 'list') {
     const secrets = await loadVault($)
-    const [action = 'list', name] = e.args.trim().split(/\s+/)
-    if (action === 'list') {
-      const bindings = await bindingsOf($)
-      const line = n => '$' + n + (bindings[n] ? ' -> ' + bindings[n].join(', ') : '')
-      return { text: secrets.size ? [...secrets.keys()].map(line).join('\n') : 'No secrets stored.' }
+    const bindings = await bindingsOf($)
+    const line = n => '$' + n + (bindings[n] ? ' -> ' + bindings[n].join(', ') : '')
+    return { text: secrets.size ? [...secrets.keys()].map(line).join('\n') : 'No secrets stored.' }
+  }
+  if (action === 'rm' && (await storedNames($)).includes(name)) {
+    await forget($, name)
+    await bind($, name, undefined)
+    return { text: 'Removed $' + name }
+  }
+  if (action === 'clear') {
+    for (const n of await storedNames($)) await forget($, n)
+    await $.store.delete('bindings')
+    const left = await storedNames($)
+    return { text: left.length ? `Could not remove ${left.map(n => '$' + n).join(', ')}.` : 'Removed every safekeys secret.' }
+  }
+  if (action === 'ignore') {
+    const [, state, mark] = e.args.trim().split(/\s+/)
+    const off = await marksOff($)
+    if ((state === 'on' || state === 'off') && mark in MARKS) {
+      await $.store.set('marksOff', state === 'off' ? [...new Set([...off, mark])] : off.filter(m => m !== mark))
+      return { text: `${mark} ${state === 'on' ? 'is honored' : 'is ignored; those prompts are guarded like any other'}` }
     }
-    if (action === 'rm' && secrets.has(name)) {
-      await forget($, name)
-      await bind($, name, undefined)
-      return { text: 'Removed $' + name }
-    }
-    if (action === 'clear') {
-      for (const n of secrets.keys()) await forget($, n)
-      await $.store.delete('bindings')
-      return { text: 'Removed every safekeys secret.' }
-    }
-    if (action === 'ignore') {
-      const [, state, mark] = e.args.trim().split(/\s+/)
-      const off = await marksOff($)
-      if ((state === 'on' || state === 'off') && mark in MARKS) {
-        await $.store.set('marksOff', state === 'off' ? [...new Set([...off, mark])] : off.filter(m => m !== mark))
-        return { text: `${mark} ${state === 'on' ? 'is honored' : 'is ignored; those prompts are guarded like any other'}` }
-      }
-      if (state) return { text: 'Usage: /safekeys ignore [on|off ' + Object.keys(MARKS).join('|') + ']' }
-      return { text: Object.entries(MARKS).map(([m, who]) => `${m}=1 ${off.includes(m) ? 'off' : 'on'}: ${who}`).join('\n') }
-    }
-    if (action === 'bindings') {
-      const [, state] = e.args.trim().split(/\s+/)
-      if (state === 'on' || state === 'off') await $.store.set('bindingsOff', state === 'off')
-      else if (state) return { text: 'Usage: /safekeys bindings [on|off]' }
-      return { text: (await stored($, 'bindingsOff', false))
-        ? 'Bindings are off: bound keys go anywhere without asking. Masking is unchanged.'
-        : 'Bindings are on: a bound key headed anywhere else asks first.' }
-    }
-    return { text: 'Usage: /safekeys list | rm NAME | clear | ignore | bindings' }
-  })
+    if (state) return { text: 'Usage: /safekeys ignore [on|off ' + Object.keys(MARKS).join('|') + ']' }
+    return { text: Object.entries(MARKS).map(([m, who]) => `${m}=1 ${off.includes(m) ? 'off' : 'on'}: ${who}`).join('\n') }
+  }
+  if (action === 'bindings') {
+    const [, state] = e.args.trim().split(/\s+/)
+    if (state === 'on' || state === 'off') await $.store.set('bindingsOff', state === 'off')
+    else if (state) return { text: 'Usage: /safekeys bindings [on|off]' }
+    return { text: (await stored($, 'bindingsOff', false))
+      ? 'Bindings are off: bound keys go anywhere without asking. Masking is unchanged.'
+      : 'Bindings are on: a bound key headed anywhere else asks first.' }
+  }
+  return { text: 'Usage: /safekeys list | rm NAME | clear | ignore | bindings' }
 }
 
 // Marks that a tool sets on the `claude -p` calls it makes to read past conversations: a $: in such
@@ -248,8 +254,12 @@ async function guardTool($, e, next) {
     return { deny: `safekeys blocked this command: it would print part or a transformed copy of $${sliced}. Use $${sliced} whole.` }
   }
   const stray = e.tool === 'Bash' && await strayDestination($, e.command, secrets)
-  if (stray && !(await confirmStray($, stray, e.command))) {
-    return { deny: `safekeys stopped this command: $${stray.name} may only go to ${stray.allowed}, and this command would ${stray.where}. The user did not allow it.` }
+  const answer = stray && await confirmStray($, stray, e.command)
+  if (stray && answer !== 'run') {
+    const why = answer === 'unasked'
+      ? 'safekeys could not ask the user here; they can add the host to the binding or run /safekeys bindings off.'
+      : 'The user did not allow it.'
+    return { deny: `safekeys stopped this command: $${stray.name} may only go to ${stray.allowed}, and this command would send it to ${stray.places}. ${why}` }
   }
   const r = await next(e.tool === 'Bash' ? withSecrets(e, secrets) : e)
   if (r.deny) return r
@@ -265,35 +275,33 @@ async function guardTool($, e, next) {
   return { deny: text }
 }
 
-// A bound key the command would send somewhere its binding doesn't list, or that the
-// command hides its handling of. Keys without a binding, or bound to `any`, are not
-// checked, and none are while `/safekeys bindings off` holds.
+// A bound key the command would send to a host its binding doesn't list. `local` lists
+// none, so with it only loopback passes. Keys without a binding, or bound to `any`, are
+// not checked, and none are while `/safekeys bindings off` holds.
 async function strayDestination($, command, secrets) {
   if (await stored($, 'bindingsOff', false)) return
   const bindings = await bindingsOf($)
   const bound = namesIn(command, secrets).filter(name => bindings[name] && !bindings[name].includes('any'))
   if (!bound.length) return
-  const { web, ssh, unclear } = destinationsOf(command)
+  const { web, ssh } = destinationsOf(command)
   for (const name of bound) {
     const entries = bindings[name]
-    const local = entries.includes('local')
-    const places = web.filter(host => local || !webAllowed(host, entries))
+    const places = web.filter(host => !webAllowed(host, entries))
     for (const target of ssh) {
-      if (local || !sshAllowed(await sshNamesOf($, target), entries)) places.push('ssh:' + target)
+      if (!sshAllowed(await sshNamesOf($, target), entries)) places.push('ssh:' + target)
     }
-    if (places.length || unclear) {
-      const where = places.length ? 'send it to ' + places.join(', ') : 'run code safekeys cannot see, such as $(...) or eval'
-      return { name, allowed: entries.join(', '), where }
-    }
+    if (places.length) return { name, allowed: entries.join(', '), places: places.join(', ') }
   }
 }
 
+// 'run', 'refused', or 'unasked' when this session has no one to ask.
 async function confirmStray($, stray, command) {
   const run = 'Run it this time'
   try {
-    return await $.ui.ask(`$${stray.name} may only go to ${stray.allowed}, but this command would ${stray.where}:\n${command}\nRun it anyway?`, [run, "Don't run"]) === run
+    const answer = await $.ui.ask(`$${stray.name} may only go to ${stray.allowed}, but this command would send it to ${stray.places}:\n${command}\nRun it anyway?`, [run, "Don't run"])
+    return answer === run ? 'run' : 'refused'
   } catch {
-    return false
+    return 'unasked'
   }
 }
 
@@ -428,15 +436,15 @@ async function stampPath($) {
   return stampFile
 }
 
-// An item that won't read (deleted meanwhile, locked, not ours) is skipped, so one
-// bad item can't stop the rest from being masked.
+// An item that won't read (deleted meanwhile, locked, not ours) keeps the value it last
+// read with, or is skipped, so one bad item can't stop the rest from being masked.
 async function readAll($) {
   const secrets = new Map()
   for (const name of await storedNames($)) {
     try {
       secrets.set(name, await lookup($, name))
     } catch {
-      // skipped
+      if (lastGood.has(name)) secrets.set(name, lastGood.get(name))
     }
   }
   return secrets
@@ -444,15 +452,19 @@ async function readAll($) {
 
 // Names come back from the keychain, where any program can plant an item, so only
 // names that are plain shell variable names are trusted into commands and patterns.
+// A listing that failed throws: read as "no keys", it would switch masking off.
 async function storedNames($) {
   let names
   if (await os($) === 'Darwin') {
-    const { stdout } = await $.process.run(['security', 'dump-keychain'])
+    const { exitCode, stdout } = await $.process.run(['security', 'dump-keychain'])
+    if (exitCode !== 0) throw new Error('safekeys could not list the keychain')
     names = stdout.split(/^keychain: /m)
       .filter(item => item.includes(`"svce"<blob>="${SERVICE}"`))
       .map(item => item.match(/"acct"<blob>="([^"]*)"/)?.[1])
   } else {
-    const { stdout, stderr } = await $.process.run(['secret-tool', 'search', '--all', '--unlock', 'service', SERVICE])
+    // secret-tool also exits non-zero when nothing matches, so only an unexpected line counts.
+    const { exitCode, stdout, stderr } = await $.process.run(['secret-tool', 'search', '--all', '--unlock', 'service', SERVICE])
+    if (exitCode !== 0 && /^(?!\[|\w+(\.\w+)? = ).+$/m.test(stderr)) throw new Error('safekeys could not list the keyring')
     names = [...(stdout + stderr).matchAll(/^attribute\.account = (.+)$/gm)].map(m => m[1])
   }
   return [...new Set(names.filter(name => name && NAME.test(name)))]
