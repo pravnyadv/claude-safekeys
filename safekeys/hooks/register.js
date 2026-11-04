@@ -237,6 +237,7 @@ function storedReferences(text, secrets) {
 async function guardTool($, e, next) {
   const secrets = await currentSecrets($)
   if (!secrets.size) return next(e)
+  if (e.tool === 'Bash' && OWN_PREFIX.test(e.command)) e = { ...e, command: e.command.replace(OWN_PREFIX, '') }
   const shield = shieldFor(secrets)
   const leaked = findLeak(e, shield)
   if (leaked) {
@@ -366,6 +367,10 @@ function briefing(names) {
 function namesIn(command, secrets) {
   return [...secrets.keys()].filter(name => new RegExp('\\$\\{?' + name + '\\b').test(command))
 }
+
+// Auto mode can make Claude resend a command as this hook rewrote it. The helper line is
+// ours, so it is dropped before any check and added back from the names the command uses.
+const OWN_PREFIX = /^\. safekeys-env [A-Za-z0-9_ ]+\n/
 
 function withSecrets(e, secrets) {
   const used = namesIn(e.command, secrets)
