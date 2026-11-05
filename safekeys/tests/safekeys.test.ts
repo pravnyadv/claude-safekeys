@@ -474,13 +474,6 @@ test('an @-mention of a file holding a key is refused, and other files attach', 
   expect((await $.prompt.mention({ mention: 'a.md', path: '/w/a.md' })).deny).toBeUndefined()
 })
 
-test('a reminder attachment that quotes a key is masked', async ($, on) => {
-  fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
-  on('prompt.attachment', ($, e) => ({ text: e.text }))
-  const out = await $.prompt.attachment({ type: 'edited_text_file', text: `.env changed:\nSTRIPE_KEY=${FAKE}`, origin: { kind: 'engine' } })
-  expect(out.text).toBe('.env changed:\nSTRIPE_KEY=$STRIPE_KEY')
-})
-
 test('a saved key pasted raw into a later prompt is masked there too', async ($, on) => {
   fakeKeychain(on, 'Darwin', new Map([['STRIPE_KEY', FAKE]]))
   passThroughPrompts(on)

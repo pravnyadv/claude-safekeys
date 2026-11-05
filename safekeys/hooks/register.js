@@ -81,15 +81,6 @@ export function register(on) {
     return { deny: `safekeys: the file holds the value of $${leaked}` }
   })
 
-  // Reminders such as "this file changed" carry file text. Organisation-managed sessions
-  // don't run a user's mod on this event; there this hook does nothing.
-  on('prompt.attachment', async ($, e, next) => {
-    const secrets = await currentSecrets($)
-    if (!secrets.size) return next(e)
-    const text = maskText(e.text, shieldFor(secrets))
-    return next(text === e.text ? e : { ...e, text })
-  })
-
   // A forked slash command never raises prompt.submit, so its arguments are checked here.
   on('command.run', async ($, e, next) => {
     if (e.args.match(TOKEN)) return { text: 'safekeys: a $: value cannot be passed to a slash command. Send it in a normal prompt.' }
