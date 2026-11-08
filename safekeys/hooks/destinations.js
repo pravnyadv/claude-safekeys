@@ -29,6 +29,9 @@ const SSH_VALUED = new Set(['-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J'
 const HOST = /^(\*\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}$|^(\d{1,3}\.){3}\d{1,3}$/i
 const SSH_TARGET = /^[A-Za-z0-9._-]+$/
 const REDIRECT = /^\d*[<>]/
+// curl options whose value is sent to, or written from, the URL's host: never a destination.
+const CURL_CARRIES = /^(-[dHFwo]|--data(-[a-z]+)?|--json|--header|--form(-string)?|--write-out|--output)$/
+const CURL_CARRIES_JOINED = /^(-[dHFwo].|--(data(-[a-z]+)?|json|header|form(-string)?|write-out|output)=)/
 
 // The entries of a binding as typed after `@`, or undefined when it doesn't read as one.
 export function parseBinding(spec) {
@@ -45,18 +48,36 @@ export function destinationsOf(command) {
   const calls = commands.flatMap(sshCalls)
   const ssh = [...new Set(calls.map(call => call.host))]
   // The command an ssh call runs is checked by the ssh target's binding alone.
-  let here = command
-  for (const [start, end] of calls.map(call => call.remote).filter(Boolean).reverse()) {
-    here = here.slice(0, start) + ' ' + here.slice(end)
-  }
+  const here = without(command, calls.map(call => call.remote).filter(Boolean))
   const web = new Set()
   for (const m of here.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
   if (NETWORK_TOOL.test(here)) {
-    for (const m of here.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
-    for (const m of here.matchAll(IPV4)) web.add(m[1])
+    const named = without(here, simpleCommands(here).flatMap(curlCarried))
+    for (const m of named.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
+    for (const m of named.matchAll(IPV4)) web.add(m[1])
   }
   for (const target of ssh) web.delete(target)
   return { web: [...web].filter(host => !LOOPBACK.test(host)), ssh }
+}
+
+// The line with each [start, end] span blanked; offsets stay valid for later spans.
+function without(line, spans) {
+  for (const [start, end] of [...spans].sort((a, b) => b[0] - a[0])) line = line.slice(0, start) + ' '.repeat(end - start) + line.slice(end)
+  return line
+}
+
+// Spans of the data, headers and output paths in a curl call, so a host named only
+// inside them (a DNS record's content, a Host: header) is not read as where curl connects.
+function curlCarried(words) {
+  const at = words.findIndex(word => basename(word.text) === 'curl')
+  if (at < 0) return []
+  const spans = []
+  for (let i = at + 1; i < words.length; i++) {
+    const word = words[i]
+    if (CURL_CARRIES.test(word.text) && i + 1 < words.length) spans.push([words[++i].start, words[i].end])
+    else if (CURL_CARRIES_JOINED.test(word.text)) spans.push([word.start, word.end])
+  }
+  return spans
 }
 
 // The command a simple command runs once wrappers and VAR=value words are skipped.
