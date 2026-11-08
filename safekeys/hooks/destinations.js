@@ -9,7 +9,7 @@
 // shows counts: a URL, an ssh/scp/rsync target, or a bare host handed to a network tool.
 // Loopback is this machine, and what runs on a remote host is that host's business.
 
-const URL_HOST = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^/\s'"@]*@)?([^/\s:'"?#\\]+)/gi
+const URL_HOST = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^/\s'"@]*@)?([^/\s:'"?#;|&\\]+)/gi
 const BARE_HOST = /(?<![\w.@/:-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?=$|[/\s'"?#;)])/gi
 const IPV4 = /(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])/g
 // Bare names that are far more often files than hosts.
@@ -30,8 +30,8 @@ const HOST = /^(\*\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}$|^(\d{1,3}\.){3}\d{1,3}$/i
 const SSH_TARGET = /^[A-Za-z0-9._-]+$/
 const REDIRECT = /^\d*[<>]/
 // curl options whose value is sent to, or written from, the URL's host: never a destination.
-const CURL_CARRIES = /^(-[dHFwo]|--data(-[a-z]+)?|--json|--header|--form(-string)?|--write-out|--output)$/
-const CURL_CARRIES_JOINED = /^(-[dHFwo].|--(data(-[a-z]+)?|json|header|form(-string)?|write-out|output)=)/
+const CURL_CARRIES = /^(-[dHFwouAeK]|--data(-[a-z]+)?|--json|--header|--form(-string)?|--write-out|--output|--user|--user-agent|--referer|--config)$/
+const CURL_CARRIES_JOINED = /^(-[dHFwouAeK].|--(data(-[a-z]+)?|json|header|form(-string)?|write-out|output|user|user-agent|referer|config)=)/
 
 // The entries of a binding as typed after `@`, or undefined when it doesn't read as one.
 export function parseBinding(spec) {
@@ -44,17 +44,46 @@ export function parseBinding(spec) {
 
 // Where the command would send data: web hosts, and ssh targets.
 export function destinationsOf(command) {
+  const heredocs = [...command.matchAll(/<<-?\s*['"]?([A-Za-z_][\w]*)['"]?[^\n]*\n[\s\S]*?^\s*\1\s*$/gm)].map(m => {
+    const line = command.slice(command.lastIndexOf('\n', m.index - 1) + 1, m.index + m[0].indexOf('\n'))
+    // Only a body read as data is skipped; one fed to an interpreter is code to check.
+    if (!/^\s*(?:\S+\/)?(?:cat|tee|curl|wget|http|xh|gh)\b[^|;&]*$/.test(line)) return [m.index, m.index]
+    const start = m.index + m[0].indexOf('\n') + 1
+    return [start, m.index + m[0].length]
+  })
+  command = without(command, heredocs)
   const commands = simpleCommands(command)
   const calls = commands.flatMap(sshCalls)
   const ssh = [...new Set(calls.map(call => call.host))]
   // The command an ssh call runs is checked by the ssh target's binding alone.
   const here = without(command, calls.map(call => call.remote).filter(Boolean))
-  const named = without(here, simpleCommands(here).flatMap(curlCarried))
+  const parts = simpleCommands(here)
+  const named = without(here, parts.flatMap((words, i) => carried(words, parts[i + 1]?.[0]?.text === 'xargs')))
   const web = new Set()
   for (const m of named.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
   if (NETWORK_TOOL.test(here)) {
-    for (const m of named.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
-    for (const m of named.matchAll(IPV4)) web.add(m[1])
+    const bare = without(named, parts.flatMap(words => {
+      const tool = toolOf(words)?.tool
+      return ['jq', 'echo'].includes(tool) && !/\|\s*xargs\b/.test(here) ? [[words[0].start, words.at(-1).end]] : []
+    }))
+    for (const m of bare.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
+    for (const m of bare.matchAll(IPV4)) web.add(m[1])
+    for (const words of parts) {
+      if (!words.some(word => basename(word.text) === 'curl')) continue
+      for (let i = 0; i < words.length; i++) {
+        const word = words[i].text
+        const value = word === '--connect-to' ? words[i + 1]?.text : word.startsWith('--connect-to=') ? word.slice(13) : undefined
+        if (value) {
+          const host = value.split(':')[2]
+          if (host) web.add(host.toLowerCase())
+        }
+        if (/^-x[^-]/.test(word) && named.slice(words[i].start, words[i].end).trim()) {
+          const host = word.slice(2).replace(/^[a-z]+:\/\//i, '').split(':')[0]
+          web.delete(word.toLowerCase())
+          if (host) web.add(host.toLowerCase())
+        }
+      }
+    }
   }
   for (const target of ssh) web.delete(target)
   return { web: [...web].filter(host => !LOOPBACK.test(host)), ssh }
@@ -76,6 +105,23 @@ function curlCarried(words) {
     const word = words[i]
     if (CURL_CARRIES.test(word.text) && i + 1 < words.length) spans.push([words[++i].start, words[i].end])
     else if (CURL_CARRIES_JOINED.test(word.text)) spans.push([word.start, word.end])
+  }
+  return spans
+}
+
+// Values carried in request options and HTTP request items are not destinations.
+function carried(words, feedsXargs) {
+  const spans = curlCarried(words)
+  const { tool, at } = toolOf(words) ?? {}
+  if (tool === 'jq' && !feedsXargs) return [[words[0].start, words.at(-1).end]]
+  const valued = tool === 'wget' ? /^(--header|--post-data|--body-data|--referer|-O|--output-document)$/
+    : tool === 'gh' ? /^(-f|-F|--field|--raw-field)$/ : null
+  for (let i = (at ?? -1) + 1; i < words.length; i++) {
+    const word = words[i]
+    if (valued?.test(word.text) && i + 1 < words.length) spans.push([words[++i].start, words[i].end])
+    else if (tool === 'wget' && /^(--header|--post-data|--body-data|--referer|--output-document)=/.test(word.text)) spans.push([word.start, word.end])
+    else if (tool === 'gh' && /^(--field|--raw-field)=/.test(word.text)) spans.push([word.start, word.end])
+    else if (['http', 'https', 'xh'].includes(tool) && /^[^:=\s]+(?::=|==|=|:)/.test(word.text) && !/^[a-z]+:\/\//i.test(word.text) && !/^[a-z0-9.-]+:\d+(?:\/|$)/i.test(word.text)) spans.push([word.start, word.end])
   }
   return spans
 }
