@@ -49,10 +49,10 @@ export function destinationsOf(command) {
   const ssh = [...new Set(calls.map(call => call.host))]
   // The command an ssh call runs is checked by the ssh target's binding alone.
   const here = without(command, calls.map(call => call.remote).filter(Boolean))
+  const named = without(here, simpleCommands(here).flatMap(curlCarried))
   const web = new Set()
-  for (const m of here.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
+  for (const m of named.matchAll(URL_HOST)) web.add(m[1].toLowerCase())
   if (NETWORK_TOOL.test(here)) {
-    const named = without(here, simpleCommands(here).flatMap(curlCarried))
     for (const m of named.matchAll(BARE_HOST)) if (!FILE_ENDINGS.test(m[1])) web.add(m[1].toLowerCase())
     for (const m of named.matchAll(IPV4)) web.add(m[1])
   }
@@ -66,8 +66,8 @@ function without(line, spans) {
   return line
 }
 
-// Spans of the data, headers and output paths in a curl call, so a host named only
-// inside them (a DNS record's content, a Host: header) is not read as where curl connects.
+// Spans of the data, headers and output paths in a curl call, so a host or URL named only
+// inside them (a DNS record's content, a redirect rule) is not read as where curl connects.
 function curlCarried(words) {
   const at = words.findIndex(word => basename(word.text) === 'curl')
   if (at < 0) return []
