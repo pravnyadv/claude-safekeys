@@ -102,7 +102,7 @@ It doesn't cover:
 - It guards against accidents. A session an attacker already controls is out of reach.
 - Your key is visible in the input box until you press Enter.
 - A destination hidden in a variable (`curl "$API_URL"`) or inside a script can't be seen, so it isn't checked.
-- Auto mode can refuse the first run of a command that uses a stored key. safekeys adds a line to the front of the command, and auto mode then says a hook changed the command after it reviewed it. Claude can send the rewritten command again and it goes through, but a model sometimes gives up instead. If yours does, approve the command yourself or switch out of auto mode for that step. It's the same for a command that writes a key into a file.
+- Auto mode reviews a command before it runs and refuses one that a hook changed afterwards. So safekeys tells Claude to start commands that use a stored key with the line `. safekeys-env NAME` itself, and leaves such a command as it is. If a model skips that line, the hook adds it and auto mode can refuse the first attempt. Approve that command yourself, or switch out of auto mode for the step. Commands that write a key into a file can be refused by auto mode on its own judgment too.
 
 ## Why not a .env file?
 
