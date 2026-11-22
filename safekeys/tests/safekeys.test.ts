@@ -699,6 +699,21 @@ test('a command resent with the safekeys-env line already on it is checked and r
   expect(ran).toEqual(['. safekeys-env PW\nssh dev.example.com "echo $PW | sudo -S true"'])
 })
 
+test('a command that already opens with the right safekeys-env line reaches the tool unchanged', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE], ['B_KEY', FAKE + 'x']]))
+  const ran = answering(on, 'unused')
+  const own = '. safekeys-env B_KEY A_KEY\necho "$A_KEY $B_KEY"'
+  await $.tool.call({ tool: 'Bash', command: own })
+  expect(ran).toEqual([own])
+})
+
+test('a safekeys-env line that misses a name the command uses is replaced with the right one', async ($, on) => {
+  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE], ['B_KEY', FAKE + 'x']]))
+  const ran = answering(on, 'unused')
+  await $.tool.call({ tool: 'Bash', command: '. safekeys-env A_KEY\necho "$A_KEY $B_KEY"' })
+  expect(ran).toEqual(['. safekeys-env A_KEY B_KEY\necho "$A_KEY $B_KEY"'])
+})
+
 test('/safekeys bindings off lets bound keys go anywhere, and on brings the question back', async ($, on) => {
   fakeKeychain(on, 'Darwin', new Map([['K', FAKE]]), { store: { bindings: { K: ['ssh:viradev.example.com'] } } })
   const ran = answering(on, "Don't run")
