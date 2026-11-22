@@ -1,4 +1,12 @@
 {
   "description": "safekeys hooks module",
-  "modules": ["./register.js"]
+  "modules": ["./register.js"],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/prefix.cjs\"" }]
+      }
+    ]
+  }
 }

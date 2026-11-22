@@ -255,7 +255,7 @@ async function guardTool($, e, next) {
       : 'The user did not allow it.'
     return { deny: `safekeys stopped this command: $${stray.name} may only go to ${stray.allowed}, and this command would send it to ${stray.places}. ${why}` }
   }
-  const r = await next(e.tool === 'Bash' ? withSecrets(e, secrets, sent) : e)
+  const r = await next(sent)
   if (r.deny) return r
   // Every field is masked, not only the text Claude reads: an Edit's result keeps the
   // whole original file, and the transcript stores all of it.
@@ -357,9 +357,8 @@ function freshName(taken) {
 
 function briefing(names) {
   return `safekeys: ${names.join(', ')} hold secrets the user stored in the OS keychain. ` +
-    'Use them by reference as ordinary environment variables. Start any Bash command that names one with ' +
-    'the line `. safekeys-env NAME` (all the names it uses, space-separated) to get the real value exported, for example ' +
-    '". safekeys-env NAME" on the first line and echo "API_KEY=$NAME" >> .env on the second. Writing them to files the user ' +
+    'Use them by reference as ordinary environment variables: any Bash command that names one gets ' +
+    'the real value exported, for example echo "API_KEY=$NAME" >> .env. Writing them to files the user ' +
     'asks for is expected. Tool output is masked automatically, so you will see the $NAME reference ' +
     'wherever the value appears. Do not try to work out the value itself.'
 }
@@ -371,19 +370,10 @@ function namesIn(command, secrets) {
   return [...secrets.keys()].filter(name => new RegExp('\\$\\{?' + name + '\\b').test(command))
 }
 
-// Auto mode can make Claude resend a command as this hook rewrote it. The helper line is
-// ours, so it is dropped before any check and added back from the names the command uses.
+// The `. safekeys-env` line is added by hooks/prefix.cjs, a command hook, which auto mode lets
+// change a Bash call where it denies a change made by a module hook. A command resent with
+// the line on it is checked without it and passed on as sent.
 const OWN_PREFIX = /^\. safekeys-env [A-Za-z0-9_ ]+\n/
-
-// A command that already opens with the right line is passed on as sent: auto mode refuses
-// a command a hook changed after it reviewed it, and an unchanged one needs no second review.
-function withSecrets(e, secrets, sent) {
-  const used = namesIn(e.command, secrets)
-  if (!used.length) return e
-  const own = sent.command.match(OWN_PREFIX)?.[0].trim().split(' ').slice(2)
-  if (own && own.length === used.length && used.every(name => own.includes(name))) return sent
-  return { ...e, command: `. safekeys-env ${used.join(' ')}\n${e.command}` }
-}
 
 // Keychain access: the only place that runs `security` or `secret-tool`.
 
@@ -396,10 +386,21 @@ async function os($) {
 async function currentSecrets($) {
   try {
     lastGood = await loadVault($)
+    await publishNames($, lastGood)
   } catch {
     // keep masking with the last list that loaded
   }
   return lastGood
+}
+
+// hooks/prefix.cjs runs as a plain command with no keychain listing of its own, so it reads
+// the names (never the values) from this file beside the stamp.
+let publishedNames
+async function publishNames($, secrets) {
+  const names = JSON.stringify([...secrets.keys()])
+  if (names === publishedNames) return
+  await $.fs.write((await stampPath($)).replace(/stamp$/, 'names'), names)
+  publishedNames = names
 }
 
 // Reloads whenever the stamp moved, including after this session's own change,
