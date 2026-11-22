@@ -28,7 +28,8 @@ function fakeKeychain(on, system: System, items = new Map<string, string>(), { b
     return stamp.text ? { value: stamp.text } : { deny: 'ENOENT' }
   })
   on('fs.write', ($, e) => {
-    stamp.text = e.text
+    if (e.path.endsWith('safekeys.stamp')) stamp.text = e.text
+    else files[e.path] = e.text
     return { value: undefined }
   })
   on('process.run', ($, e) => {
@@ -86,7 +87,7 @@ for (const system of ['Darwin', 'Linux'] as const) {
     expect(JSON.stringify(out)).not.toContain(FAKE)
   })
 
-  test(`${system}: a Bash command that names a secret gets it exported, and its output is masked`, async ($, on) => {
+  test(`${system}: a Bash command that names a secret reaches the tool as written, and its output is masked`, async ($, on) => {
     fakeKeychain(on, system, new Map([['STRIPE_KEY', FAKE]]))
     let ran = ''
     on('tool.call', ($, e) => {
@@ -94,7 +95,7 @@ for (const system of ['Darwin', 'Linux'] as const) {
       return { result: { stdout: `STRIPE_KEY=${FAKE}`, stderr: '' }, text: `STRIPE_KEY=${FAKE}` }
     })
     const out = await $.tool.call({ tool: 'Bash', command: 'echo "STRIPE_KEY=$STRIPE_KEY" >> .env' })
-    expect(ran).toBe('. safekeys-env STRIPE_KEY\necho "STRIPE_KEY=$STRIPE_KEY" >> .env')
+    expect(ran).toBe('echo "STRIPE_KEY=$STRIPE_KEY" >> .env')
     expect(ran).not.toContain('security')
     expect(out.result.stdout).toBe('STRIPE_KEY=$STRIPE_KEY')
   })
@@ -129,7 +130,7 @@ for (const system of ['Darwin', 'Linux'] as const) {
     await $.tool.call({ tool: 'Bash', command: 'echo "$STRIPE_KEY" > .env' })
     expect(items.get('STRIPE_KEY')).toBe(FAKE)
     expect(argvs.join('\n')).toContain(system === 'Darwin' ? 'security -i' : 'secret-tool store')
-    expect(argvs.join('\n')).toContain('. safekeys-env STRIPE_KEY')
+    expect(argvs).toContain('echo "$STRIPE_KEY" > .env')
     expect(argvs.join('\n')).not.toContain(FAKE)
   })
 }
@@ -699,19 +700,12 @@ test('a command resent with the safekeys-env line already on it is checked and r
   expect(ran).toEqual(['. safekeys-env PW\nssh dev.example.com "echo $PW | sudo -S true"'])
 })
 
-test('a command that already opens with the right safekeys-env line reaches the tool unchanged', async ($, on) => {
-  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE], ['B_KEY', FAKE + 'x']]))
-  const ran = answering(on, 'unused')
-  const own = '. safekeys-env B_KEY A_KEY\necho "$A_KEY $B_KEY"'
-  await $.tool.call({ tool: 'Bash', command: own })
-  expect(ran).toEqual([own])
-})
-
-test('a safekeys-env line that misses a name the command uses is replaced with the right one', async ($, on) => {
-  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE], ['B_KEY', FAKE + 'x']]))
-  const ran = answering(on, 'unused')
-  await $.tool.call({ tool: 'Bash', command: '. safekeys-env A_KEY\necho "$A_KEY $B_KEY"' })
-  expect(ran).toEqual(['. safekeys-env A_KEY B_KEY\necho "$A_KEY $B_KEY"'])
+test('the names of stored keys, never their values, are published for the prefix hook', async ($, on) => {
+  const files: Record<string, string> = {}
+  fakeKeychain(on, 'Darwin', new Map([['A_KEY', FAKE], ['B_KEY', FAKE + 'x']]), { files })
+  answering(on, 'unused')
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(files['/home/test/.claude/safekeys.names']).toBe('["A_KEY","B_KEY"]')
 })
 
 test('/safekeys bindings off lets bound keys go anywhere, and on brings the question back', async ($, on) => {

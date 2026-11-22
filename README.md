@@ -17,7 +17,7 @@ You need Claude Code v2.1.287 or newer.
 /plugin install safekeys@pravnyadv
 ```
 
-Then run `/reload-plugins`. macOS works out of the box. On Linux, install `secret-tool` (`sudo apt install libsecret-tools`) and have a keyring running, such as GNOME Keyring.
+Then run `/reload-plugins`. You need Node.js on your PATH. macOS works out of the box. On Linux, install `secret-tool` (`sudo apt install libsecret-tools`) and have a keyring running, such as GNOME Keyring.
 
 ## Use
 
@@ -82,7 +82,7 @@ To stop the questions for every key without losing the saved limits:
 ## How it works
 
 - A hook rewrites your prompt before Claude Code saves or sends it, swapping the key for `$NAME`.
-- When Claude runs a command that mentions `$NAME`, the hook reads the real value from the keychain and exports it for that command. The value never appears in the command text.
+- When Claude runs a command that mentions `$NAME`, a small hook puts `. safekeys-env NAME` in front of it. That line reads the real value from the keychain and exports it for that command, so the value never appears in the command text. It is a plain command hook, because auto mode lets those change a command and refuses the same change from a module hook.
 - Every tool result is masked before Claude reads it. That covers encoded copies (hex, including how `xxd` and `od` print it, base64, upper case, escaped forms) and long pieces of a key.
 - A tool call that would write a key of 12 or more characters is refused. Shorter keys are masked only as whole words and never refuse a call, because `root` as a password is also the user name in the same command.
 
@@ -102,7 +102,7 @@ It doesn't cover:
 - It guards against accidents. A session an attacker already controls is out of reach.
 - Your key is visible in the input box until you press Enter.
 - A destination hidden in a variable (`curl "$API_URL"`) or inside a script can't be seen, so it isn't checked.
-- Auto mode reviews a command before it runs and refuses one that a hook changed afterwards. So safekeys tells Claude to start commands that use a stored key with the line `. safekeys-env NAME` itself, and leaves such a command as it is. If a model skips that line, the hook adds it and auto mode can refuse the first attempt. Approve that command yourself, or switch out of auto mode for the step. Commands that write a key into a file can be refused by auto mode on its own judgment too.
+- Auto mode can still refuse a command that uses a stored key in two cases: an earlier command in the same Claude reply was also changed by a hook, or the command asks to run outside the sandbox. Claude can send it again, or you can approve it yourself. Auto mode may also refuse a command that writes a key into a file, on its own judgment.
 
 ## Why not a .env file?
 
