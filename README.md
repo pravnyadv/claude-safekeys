@@ -2,6 +2,8 @@
 
 A Claude Code plugin for giving Claude an API key or password without pasting it into the chat.
 
+![Typing a key as $:DEMO_KEY=..., then asking Claude to print the prompt back: only $DEMO_KEY appears](docs/demo.gif)
+
 ```
 $:STRIPE_KEY=sk_live_abc123 add this to .env
 ```
@@ -52,7 +54,7 @@ Then search everything Claude Code saved, from a normal terminal:
 grep -rl "sk_live_test_1234567890abcdef" ~/.claude/projects ~/.claude/history.jsonl
 ```
 
-Nothing should match. On 0.5.5 the saved prompt reads `$DEMO_KEY say hello`, and a later command containing the value, or a piece of it, was blocked. Clean up with `/safekeys rm DEMO_KEY`.
+Nothing should match. On 0.5.7 the saved prompt reads `$DEMO_KEY say hello`, and a later command containing the value, or a piece of it, was blocked. Clean up with `/safekeys rm DEMO_KEY`.
 
 ## Limiting where a key can go
 
